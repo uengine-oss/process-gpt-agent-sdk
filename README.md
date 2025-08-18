@@ -117,12 +117,94 @@ asyncio.run(submit_task_example())
 
 ## 🔄 워크플로우
 
+### 시퀀스 다이어그램
+
+```mermaid
+sequenceDiagram
+    participant Client as Client Application
+    participant DB as Supabase Database
+    participant TodoTable as TodoList Table
+    participant EventTable as Events Table
+    participant Server as ProcessGPT Agent Server
+    participant Executor as Agent Executor
+    participant AI as CrewAI/Langgraph/OpenAI
+
+    Note over Client, AI: ProcessGPT Agent Framework Workflow
+
+    %% Task Submission
+    Client->>DB: Submit new task
+    Client->>TodoTable: INSERT INTO todolist<br/>(agent_type, prompt, input_data, status='pending')
+    TodoTable-->>Client: Return todolist_id
+
+    %% Server Polling Loop
+    loop Every 5 seconds (configurable)
+        Server->>TodoTable: SELECT * FROM todolist<br/>WHERE agent_status='pending'<br/>AND agent_type='{configured_type}'
+        TodoTable-->>Server: Return pending tasks
+        
+        alt Tasks found
+            Server->>TodoTable: UPDATE todolist<br/>SET agent_status='in_progress',<br/>started_at=NOW()<br/>WHERE id='{todolist_id}'
+            
+            %% Event Logging - Task Started
+            Server->>EventTable: INSERT INTO events<br/>(todolist_id, event_type='task_started',<br/>event_data, message)
+            
+            %% Create Request Context
+            Server->>Server: Create ProcessGPTRequestContext<br/>from todolist data
+            
+            %% Create Event Queue
+            Server->>Server: Create ProcessGPTEventQueue<br/>with Supabase connection
+            
+            %% Execute Agent
+            Server->>Executor: execute(context, event_queue)
+            
+            %% Agent Processing with AI Frameworks
+            Executor->>AI: Use AI frameworks<br/>(CrewAI, Langgraph, OpenAI)<br/>with A2A interfaces
+            
+            loop During Agent Execution
+                AI->>Executor: Progress events/status updates
+                Executor->>Server: Forward events to ProcessGPTEventQueue
+                Server->>EventTable: INSERT INTO events<br/>(todolist_id, event_type, event_data)
+            end
+            
+            alt Agent Success
+                AI-->>Executor: Task completed successfully
+                Executor-->>Server: Task completion
+                Server->>EventTable: INSERT INTO events<br/>(event_type='task_completed')
+                Server->>TodoTable: UPDATE todolist<br/>SET agent_status='completed',<br/>agent_output='{result}',<br/>completed_at=NOW()
+            else Agent Failure
+                AI-->>Executor: Task failed with error
+                Executor-->>Server: Task failure
+                Server->>EventTable: INSERT INTO events<br/>(event_type='task_failed', error)
+                Server->>TodoTable: UPDATE todolist<br/>SET agent_status='failed',<br/>agent_output='{error}',<br/>completed_at=NOW()
+            end
+        else No tasks
+            Note over Server: Wait for next polling cycle
+        end
+    end
+
+    %% Client Status Monitoring
+    loop Client Monitoring
+        Client->>TodoTable: SELECT * FROM todolist<br/>WHERE id='{todolist_id}'
+        TodoTable-->>Client: Return task status
+        
+        Client->>EventTable: SELECT * FROM events<br/>WHERE todolist_id='{todolist_id}'<br/>ORDER BY created_at
+        EventTable-->>Client: Return event history
+        
+        alt Task Completed
+            Note over Client: Process final result
+        else Task Still Running
+            Note over Client: Continue monitoring
+        end
+    end
+```
+
+### 워크플로우 단계
+
 1. **태스크 제출**: 클라이언트가 `todolist` 테이블에 새로운 작업을 INSERT
-2. **폴링**: ProcessGPT 서버가 주기적으로 `pending` 상태의 작업들을 조회
+2. **폴링**: ProcessGPT Agent Server가 주기적으로 `pending` 상태의 작업들을 조회
 3. **상태 업데이트**: 발견된 작업의 상태를 `in_progress`로 변경
 4. **컨텍스트 생성**: todolist 데이터를 기반으로 `ProcessGPTRequestContext` 생성
 5. **이벤트 큐 생성**: Supabase 연동 `ProcessGPTEventQueue` 생성
-6. **에이전트 실행**: Google A2A SDK의 `AgentExecutor.execute()` 호출
+6. **에이전트 실행**: Google A2A SDK 인터페이스를 통해 AI 프레임워크(CrewAI, Langgraph, OpenAI) 호출
 7. **이벤트 로깅**: 실행 과정의 모든 이벤트가 `events` 테이블에 저장
 8. **완료 처리**: 최종 결과가 `todolist`의 `agent_output`에 저장
 
