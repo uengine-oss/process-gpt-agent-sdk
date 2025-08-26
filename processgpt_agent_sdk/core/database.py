@@ -1,34 +1,23 @@
-"""ProcessGPT DB utilities
-
-역할:
-- Supabase 연결/초기화
-- 안전한 RPC/CRUD 호출(재시도/폴백 포함)
-- 이벤트 기록, 작업 클레임/상태/저장/조회, 사용자·에이전트·폼·테넌트 조회
-
-반환 규칙(폴백 포함):
-- Optional 단건 조회 계열 → 실패 시 None
-- 목록/시퀀스 계열 → 실패 시 빈 리스트 []
-- 변경/기록 계열 → 실패 시 경고 로그만 남기고 None
-"""
-
 import os
 import json
 import asyncio
 import socket
 import uuid
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable, TypeVar
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
 import logging
 import random
-from typing import Callable, TypeVar
 
 T = TypeVar("T")
 
 from ..utils.logger import handle_application_error, write_log_message
 
+# ============================================================================
+# Utility: 재시도 헬퍼 및 유틸
+# 설명: 동기 DB 호출을 안전하게 재시도 (지수 백오프 + 지터) 및 유틸
+# ============================================================================
 
 async def _async_retry(
     fn: Callable[[], T],
@@ -38,15 +27,10 @@ async def _async_retry(
     base_delay: float = 0.8,
     fallback: Optional[Callable[[], T]] = None,
 ) -> Optional[T]:
-    """재시도 유틸(지수 백오프+jitter).
-
-    - 최종 실패 시: fallback이 있으면 실행, 없으면 None
-    - 로그: 시도/지연/최종 실패/폴백 사용/폴백 실패
-    """
+    """지수 백오프+jitter로 재시도하고 실패 시 fallback/None 반환."""
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            # 블로킹 DB 호출은 스레드로 위임해 이벤트 루프 차단 방지
             return await asyncio.to_thread(fn)
         except Exception as e:
             last_err = e
@@ -65,10 +49,19 @@ async def _async_retry(
     return None
  
 
+def _is_valid_uuid(value: str) -> bool:
+    """UUID 문자열 형식 검증 (v1~v8 포함)"""
+    try:
+        uuid.UUID(value)
+        return True
+    except Exception:
+        return False
 
-# ------------------------------
-# Consumer 식별자 도우미
-# ------------------------------
+
+# ============================================================================
+# DB 연결/클라이언트
+# 설명: 환경 변수 로드, Supabase 클라이언트 초기화/반환, 컨슈머 식별자
+# ============================================================================
 _supabase_client: Optional[Client] = None
 
 
@@ -103,11 +96,12 @@ def get_consumer_id() -> str:
     return f"{host}:{pid}"
 
 
-# ------------------------------
-# 폴링: 대기 작업 1건 클레임(RPC 내부에서 상태 변경 포함)
-# ------------------------------
+# ============================================================================
+# 데이터 조회
+# 설명: TODOLIST 테이블 조회, 완료 output 목록 조회, 이벤트 조회, 폼 조회, 테넌트 MCP 설정 조회, 사용자 및 에이전트 조회
+# ============================================================================
 async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict[str, Any]]:
-    """대기중 작업 하나를 RPC로 클레임하고 반환. 실패/없음 시 None."""
+    """TODOLIST 테이블에서 대기중인 워크아이템을 조회"""
     def _call():
         client = get_db_client()
         return client.rpc(
@@ -121,11 +115,8 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
     return resp.data[0]
 
 
-# ------------------------------
-# 단건 todo 조회
-# ------------------------------
 async def fetch_todo_by_id(todo_id: str) -> Optional[Dict[str, Any]]:
-    """todolist에서 특정 id의 row 단건 조회. 실패 시 None."""
+    """특정 todo id로 todolist의 단건을 조회"""
     if not todo_id:
         return None
     def _call():
@@ -140,35 +131,8 @@ async def fetch_todo_by_id(todo_id: str) -> Optional[Dict[str, Any]]:
     return resp.data
 
 
-# ------------------------------
-# 이벤트 기록
-# ------------------------------
-async def record_event(todo: Dict[str, Any], data: Dict[str, Any], event_type: Optional[str] = None) -> None:
-    """UI용 events 테이블에 이벤트 기록. 실패해도 플로우 지속."""
-    def _call():
-        client = get_db_client()
-        payload: Dict[str, Any] = {
-            "id": str(uuid.uuid4()),
-            "job_id": todo.get("proc_inst_id") or str(todo.get("id")),
-            "todo_id": str(todo.get("id")),
-            "proc_inst_id": todo.get("proc_inst_id"),
-            "crew_type": todo.get("agent_orch"),
-            "data": data,
-        }
-        if event_type is not None:
-            payload["event_type"] = event_type
-        return client.table("events").insert(payload).execute()
-
-    resp = await _async_retry(_call, name="record_event", fallback=lambda: None)
-    if resp is None:
-        write_log_message("record_event 최종 실패(무시)", level=logging.WARNING)
-
-
-# ------------------------------
-# 완료된 데이터 조회
-# ------------------------------
 async def fetch_done_data(proc_inst_id: Optional[str]) -> List[Any]:
-    """같은 proc_inst_id의 완료 output 목록 조회. 실패 시 []."""
+    """proc_inst_id로 완료된 워크아이템의 output 목록을 조회"""
     if not proc_inst_id:
         return []
     def _call():
@@ -181,45 +145,29 @@ async def fetch_done_data(proc_inst_id: Optional[str]) -> List[Any]:
     return [row.get("output") for row in (resp.data or [])]
 
 
-# ------------------------------
-# 결과 저장 (중간/최종)
-# ------------------------------
-async def save_task_result(todo_id: str, result: Any, final: bool = False) -> None:
-    """결과 저장 RPC(중간/최종). 실패해도 경고 로그 후 지속."""
-    def _call():
+def fetch_human_response_sync(job_id: str) -> Optional[Dict[str, Any]]:
+    """events에서 특정 job_id의 human_response 조회"""
+    if not job_id:
+        return None
+    try:
         client = get_db_client()
-        payload = result if isinstance(result, (dict, list)) else json.loads(json.dumps(result))
-        return client.rpc(
-            "save_task_result",
-            {"p_todo_id": todo_id, "p_payload": payload, "p_final": final},
-        ).execute()
-
-    await _async_retry(_call, name="save_task_result", fallback=lambda: None)
-
-
-# ------------------------------
-# 추가 유틸: 이벤트/작업/사용자/에이전트/폼/테넌트 조회
-# ------------------------------
-async def fetch_human_response(job_id: str) -> Optional[Dict[str, Any]]:
-    """events에서 특정 job_id의 human_response 1건 조회. 실패 시 None."""
-    def _call():
-        client = get_db_client()
-        return (
-            client.table("events")
+        resp = (
+            client
+            .table("events")
             .select("*")
             .eq("job_id", job_id)
             .eq("event_type", "human_response")
             .execute()
         )
-
-    resp = await _async_retry(_call, name="fetch_human_response")
-    if not resp or not resp.data:
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        handle_application_error("fetch_human_response_sync 실패", e, raise_error=False)
         return None
-    return resp.data[0]
 
 
 async def fetch_task_status(todo_id: str) -> Optional[str]:
-    """todolist.draft_status 조회. 실패 시 None."""
+    """todo의 draft_status를 조회한다."""
     def _call():
         client = get_db_client()
         return (
@@ -232,8 +180,9 @@ async def fetch_task_status(todo_id: str) -> Optional[str]:
     return resp.data.get("draft_status")
 
 
+
 async def fetch_all_agents() -> List[Dict[str, Any]]:
-    """모든 에이전트 목록 정규화 반환. 실패 시 []."""
+    """모든 에이전트 목록을 정규화하여 반환한다."""
     def _call():
         client = get_db_client()
         return (
@@ -264,28 +213,14 @@ async def fetch_all_agents() -> List[Dict[str, Any]]:
 
 
 async def fetch_agent_data(user_ids: str) -> List[Dict[str, Any]]:
-    """user_id(들)로 에이전트를 조회. 없거나 유효하지 않으면 모든 에이전트를 반환.
+    """TODOLIST의 user_id 값으로, 역할로 지정된 에이전트를 조회하고 정규화해 반환한다."""
 
-    - 입력은 UUID 또는 콤마(,)로 구분된 UUID 목록을 허용
-    - 유효한 UUID가 하나도 없으면 전체 에이전트 반환
-    - 유효한 UUID로 조회했는데 결과가 비면 전체 에이전트 반환
-    """
-    def _is_valid_uuid(value: str) -> bool:
-        try:
-            uuid.UUID(str(value))
-            return True
-        except Exception:
-            return False
-
-    # 1) 입력 정규화 및 UUID 필터링
     raw_ids = [x.strip() for x in (user_ids or "").split(",") if x.strip()]
     valid_ids = [x for x in raw_ids if _is_valid_uuid(x)]
 
-    # 2) 유효한 UUID가 없으면 전체 에이전트 반환
     if not valid_ids:
         return await fetch_all_agents()
 
-    # 3) 유효한 UUID로 에이전트 조회
     def _call():
         client = get_db_client()
         resp = (
@@ -316,67 +251,148 @@ async def fetch_agent_data(user_ids: str) -> List[Dict[str, Any]]:
 
     result = await _async_retry(_call, name="fetch_agent_data", fallback=lambda: [])
 
-    # 4) 결과가 없으면 전체 에이전트로 폴백
     if not result:
         return await fetch_all_agents()
 
     return result
 
 
-async def fetch_form_types(tool_val: str, tenant_id: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """폼 타입 정의 조회 및 정규화. 실패 시 기본값 반환."""
+async def fetch_form_types(tool_val: str, tenant_id: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+    """폼 타입 정의를 조회해 (form_id, fields, html)로 반환한다."""
+    form_id = tool_val[12:] if tool_val.startswith("formHandler:") else tool_val
+
     def _call():
         client = get_db_client()
-        form_id = tool_val[12:] if tool_val.startswith("formHandler:") else tool_val
         resp = (
-            client.table("form_def").select("fields_json").eq("id", form_id).eq("tenant_id", tenant_id).execute()
+            client
+            .table("form_def")
+            .select("fields_json, html")
+            .eq("id", form_id)
+            .eq("tenant_id", tenant_id)
+            .execute()
         )
         fields_json = resp.data[0].get("fields_json") if resp.data else None
-        form_html = resp.data[0].get('html') if resp.data else None
+        form_html = resp.data[0].get("html") if resp.data else None
         if not fields_json:
             return form_id, [{"key": form_id, "type": "default", "text": ""}], form_html
         return form_id, fields_json, form_html
 
-    resp = await _async_retry(_call, name="fetch_form_types", fallback=lambda: (tool_val, [{"key": tool_val, "type": "default", "text": ""}]))
-    return resp if resp else (tool_val, [{"key": tool_val, "type": "default", "text": ""}])
+    resp = await _async_retry(
+        _call,
+        name="fetch_form_types",
+        fallback=lambda: (form_id, [{"key": form_id, "type": "default", "text": ""}], None),
+    )
+    return resp if resp else (form_id, [{"key": form_id, "type": "default", "text": ""}], None)
 
 
 async def fetch_tenant_mcp_config(tenant_id: str) -> Optional[Dict[str, Any]]:
-    """테넌트 MCP 설정 조회. 실패 시 None."""
+    """테넌트 MCP 설정을 조회해 반환한다."""
     def _call():
         client = get_db_client()
         return client.table("tenants").select("mcp").eq("id", tenant_id).single().execute()
-    try:
-        resp = await _async_retry(_call, name="fetch_tenant_mcp_config", fallback=lambda: None)
-        return resp.data.get("mcp") if resp and resp.data else None
-    except Exception as e:
-        handle_application_error("fetch_tenant_mcp_config 실패", e, raise_error=False)
-        return None
+
+    resp = await _async_retry(_call, name="fetch_tenant_mcp_config", fallback=lambda: None)
+    return resp.data.get("mcp") if resp and resp.data else None
 
 
-# ------------------------------
-# 오류 상태 업데이트 (FAILED)
-# ------------------------------
-async def update_task_error(todo_id: str) -> None:
-    """작업 오류 상태 업데이트 (FAILED) - 로그 컬럼은 건드리지 않음"""
-    if not todo_id:
-        return
+async def fetch_human_users_by_proc_inst_id(proc_inst_id: str) -> str:
+    """proc_inst_id로 현재 프로세스의 모든 사용자 이메일 목록을 쉼표로 반환한다."""
+    if not proc_inst_id:
+        return ""
+    
+    def _sync():
+        try:
+            supabase = get_db_client()
+            
+            resp = (
+                supabase
+                .table('todolist')
+                .select('user_id')
+                .eq('proc_inst_id', proc_inst_id)
+                .execute()
+            )
+            
+            if not resp.data:
+                return ""
+            
+            all_user_ids = set()
+            for row in resp.data:
+                user_id = row.get('user_id', '')
+                if user_id:
+                    ids = [id.strip() for id in user_id.split(',') if id.strip()]
+                    all_user_ids.update(ids)
+            
+            if not all_user_ids:
+                return ""
+            
+            human_user_emails = []
+            for user_id in all_user_ids:
+                if not _is_valid_uuid(user_id):
+                    continue
+                
+                user_resp = (
+                    supabase
+                    .table('users')
+                    .select('id, email, is_agent')
+                    .eq('id', user_id)
+                    .execute()
+                )
+                
+                if user_resp.data:
+                    user = user_resp.data[0]
+                    is_agent = user.get('is_agent')
+                    if not is_agent:
+                        email = (user.get('email') or '').strip()
+                        if email:
+                            human_user_emails.append(email)
+            
+            return ','.join(human_user_emails)
+            
+        except Exception as e:
+            handle_application_error("사용자조회오류", e, raise_error=False)
+            return ""
+    
+    return await asyncio.to_thread(_sync)
+
+
+# ============================================================================
+# 데이터 저장
+# 설명: 이벤트/알림/작업 결과 저장
+# ============================================================================
+async def record_event(todo: Dict[str, Any], data: Dict[str, Any], event_type: Optional[str] = None) -> None:
+    """UI용 events 테이블에 이벤트 기록"""
     def _call():
         client = get_db_client()
-        return (
-            client
-            .table('todolist')
-            .update({'draft_status': 'FAILED', 'consumer': None})
-            .eq('id', todo_id)
-            .execute()
-        )
+        payload: Dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "job_id": todo.get("proc_inst_id") or str(todo.get("id")),
+            "todo_id": str(todo.get("id")),
+            "proc_inst_id": todo.get("proc_inst_id"),
+            "crew_type": todo.get("agent_orch"),
+            "data": data,
+        }
+        if event_type is not None:
+            payload["event_type"] = event_type
+        return client.table("events").insert(payload).execute()
 
-    await _async_retry(_call, name="update_task_error", fallback=lambda: None)
+    resp = await _async_retry(_call, name="record_event", fallback=lambda: None)
+    if resp is None:
+        write_log_message("record_event 최종 실패(무시)", level=logging.WARNING)
 
 
-# ============================================================================
-# 알림 저장
-# ============================================================================
+
+async def save_task_result(todo_id: str, result: Any, final: bool = False) -> None:
+    """작업 결과를 저장한다(중간/최종)."""
+    def _call():
+        client = get_db_client()
+        payload = result if isinstance(result, (dict, list)) else json.loads(json.dumps(result))
+        return client.rpc(
+            "save_task_result",
+            {"p_todo_id": todo_id, "p_payload": payload, "p_final": final},
+        ).execute()
+
+    await _async_retry(_call, name="save_task_result", fallback=lambda: None)
+
 
 def save_notification(
     *,
@@ -388,11 +404,7 @@ def save_notification(
     url: Optional[str] = None,
     from_user_id: Optional[str] = None,
 ) -> None:
-    """notifications 테이블에 알림 저장
-
-    - user_ids_csv: 쉼표로 구분된 사용자 ID 목록. 비어있으면 저장 생략
-    - 테이블 스키마는 다음 컬럼을 가정: user_id, tenant_id, title, description, type, url, from_user_id
-    """
+    """notifications 테이블에 알림 저장"""
     try:
         # 대상 사용자가 없으면 작업 생략
         if not user_ids_csv:
@@ -424,86 +436,25 @@ def save_notification(
         supabase.table("notifications").insert(rows).execute()
         write_log_message(f"알림 저장 완료: {len(rows)}건")
     except Exception as e:
-        # 알림 저장 실패는 치명적이지 않으므로 오류만 로깅
         handle_application_error("알림저장오류", e, raise_error=False)
 
-
-def _is_valid_uuid(value: str) -> bool:
-    """UUID 문자열 형식 검증 (v1~v8 포함)"""
-    try:
-        uuid.UUID(value)
-        return True
-    except Exception:
-        return False
-
-       
 # ============================================================================
-# 사용자 및 에이전트 정보 조회
+# 상태 변경
+# 설명: 실패 작업 상태 업데이트
 # ============================================================================
 
-async def fetch_human_users_by_proc_inst_id(proc_inst_id: str) -> str:
-    """proc_inst_id로 해당 프로세스의 실제 사용자(is_agent=false)들의 이메일만 쉼표로 구분하여 반환"""
-    if not proc_inst_id:
-        return ""
-    
-    def _sync():
-        try:
-            supabase = get_db_client()
-            
-            # 1. proc_inst_id로 todolist에서 user_id들 조회
-            resp = (
-                supabase
-                .table('todolist')
-                .select('user_id')
-                .eq('proc_inst_id', proc_inst_id)
-                .execute()
-            )
-            
-            if not resp.data:
-                return ""
-            
-            # 2. 모든 user_id를 수집 (중복 제거)
-            all_user_ids = set()
-            for row in resp.data:
-                user_id = row.get('user_id', '')
-                if user_id:
-                    # 쉼표로 구분된 경우 분리
-                    ids = [id.strip() for id in user_id.split(',') if id.strip()]
-                    all_user_ids.update(ids)
-            
-            if not all_user_ids:
-                return ""
-            
-            # 3. 각 user_id가 실제 사용자(is_agent=false 또는 null)인지 확인 후 이메일 수집
-            human_user_emails = []
-            for user_id in all_user_ids:
-                # UUID 형식이 아니면 스킵
-                if not _is_valid_uuid(user_id):
-                    continue
-                
-                # users 테이블에서 해당 user_id 조회
-                user_resp = (
-                    supabase
-                    .table('users')
-                    .select('id, email, is_agent')
-                    .eq('id', user_id)
-                    .execute()
-                )
-                
-                if user_resp.data:
-                    user = user_resp.data[0]
-                    is_agent = user.get('is_agent')
-                    # is_agent가 false이거나 null인 경우만 실제 사용자로 간주
-                    if not is_agent:  # False 또는 None
-                        email = (user.get('email') or '').strip()
-                        if email:
-                            human_user_emails.append(email)
-            
-            # 4. 쉼표로 구분된 문자열로 반환
-            return ','.join(human_user_emails)
-            
-        except Exception as e:
-            handle_application_error("사용자조회오류", e, raise_error=False)
-            return ""
-    
-    return await asyncio.to_thread(_sync)
+async def update_task_error(todo_id: str) -> None:
+    """실패 작업의 상태를 FAILED로 갱신한다."""
+    if not todo_id:
+        return
+    def _call():
+        client = get_db_client()
+        return (
+            client
+            .table('todolist')
+            .update({'draft_status': 'FAILED', 'consumer': None})
+            .eq('id', todo_id)
+            .execute()
+        )
+
+    await _async_retry(_call, name="update_task_error", fallback=lambda: None)

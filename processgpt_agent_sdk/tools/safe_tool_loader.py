@@ -9,23 +9,30 @@ from .knowledge_tools import Mem0Tool, MementoTool
 from ..utils.logger import write_log_message, handle_application_error
 
 
+# =============================================================================
+# SafeToolLoader
+# 설명: 로컬/외부 MCP 도구들을 안전하게 초기화·로드·종료 관리
+# =============================================================================
 class SafeToolLoader:
 	"""도구 로더 클래스"""
-	adapters = []  # MCPServerAdapter 인스턴스 등록
+	adapters = []
 	
 	ANYIO_PATCHED: bool = False
 
 	def __init__(self, tenant_id: Optional[str] = None, user_id: Optional[str] = None, agent_name: Optional[str] = None, mcp_config: Optional[Dict] = None):
+		"""실행 컨텍스트(tenant/user/agent)와 MCP 설정을 보관한다."""
 		self.tenant_id = tenant_id
 		self.user_id = user_id
 		self.agent_name = agent_name
-		# 외부에서 전달된 MCP 설정 사용 (DB 접근 금지)
 		self._mcp_servers = (mcp_config or {}).get('mcpServers', {})
 		self.local_tools = ["mem0", "memento", "human_asked"]
 		write_log_message(f"SafeToolLoader 초기화 완료 (tenant_id: {tenant_id}, user_id: {user_id})")
 
+	# =============================================================================
+	# Warmup (npx 서버 사전 준비)
+	# =============================================================================
 	def warmup_server(self, server_key: str, mcp_config: Optional[Dict] = None):
-		"""npx 기반 서버의 패키지를 미리 캐시에 저장해 실제 실행을 빠르게."""
+		"""npx 서버 패키지를 미리 캐싱해 최초 실행 지연을 줄인다."""
 		servers = (mcp_config or {}).get('mcpServers') or self._mcp_servers or {}
 		server_config = servers.get(server_key, {}) if isinstance(servers, dict) else {}
 		if not server_config or server_config.get("command") != "npx":
@@ -54,8 +61,11 @@ class SafeToolLoader:
 		except Exception:
 			pass
 
+	# =============================================================================
+	# 유틸: npx 경로 탐색
+	# =============================================================================
 	def _find_npx_command(self) -> str:
-		"""npx 명령어 경로 찾기"""
+		"""npx 실행 파일 경로를 탐색해 반환한다."""
 		try:
 			import shutil
 			npx_path = shutil.which("npx") or shutil.which("npx.cmd")
@@ -65,6 +75,9 @@ class SafeToolLoader:
 			pass
 		return "npx"
 
+	# =============================================================================
+	# 로컬 도구 생성
+	# =============================================================================
 	def create_tools_from_names(self, tool_names: List[str], mcp_config: Optional[Dict] = None) -> List:
 		"""tool_names 리스트에서 실제 Tool 객체들 생성"""
 		if isinstance(tool_names, str):
@@ -88,6 +101,9 @@ class SafeToolLoader:
 		write_log_message(f"총 {len(tools)}개 도구 생성 완료")
 		return tools
 
+	# =============================================================================
+	# 로컬 도구 로더들
+	# =============================================================================
 	def _load_mem0(self) -> List:
 		"""mem0 도구 로드 - 에이전트별 메모리"""
 		try:
@@ -110,12 +126,14 @@ class SafeToolLoader:
 	def _load_human_asked(self) -> List:
 		"""human_asked 도구 로드 (선택사항: 사용 시 외부에서 주입)"""
 		try:
-			# 필요한 경우 외부에서 HumanQueryTool을 이 패키지에 추가하여 import하고 리턴하도록 변경 가능
 			return []
 		except Exception as error:
 			handle_application_error("툴human오류", error, raise_error=False)
 			return []
 
+	# =============================================================================
+	# 외부 MCP 도구 로더
+	# =============================================================================
 	def _load_mcp_tool(self, tool_name: str, mcp_config: Optional[Dict] = None) -> List:
 		"""MCP 도구 로드 (timeout & retry 지원)"""
 		self._apply_anyio_patch()
@@ -157,8 +175,11 @@ class SafeToolLoader:
 					handle_application_error(f"툴{tool_name}오류", e, raise_error=False)
 					return []
 
+	# =============================================================================
+	# anyio 서브프로세스 stderr 패치
+	# =============================================================================
 	def _apply_anyio_patch(self):
-		"""anyio stderr 패치 적용"""
+		"""stderr에 fileno 없음 대비: PIPE로 보정해 예외를 방지한다."""
 		if SafeToolLoader.ANYIO_PATCHED:
 			return
 		from anyio._core._subprocesses import open_process as _orig
@@ -173,9 +194,12 @@ class SafeToolLoader:
 		anyio._core._subprocesses.open_process = patched_open_process
 		SafeToolLoader.ANYIO_PATCHED = True
 
+	# =============================================================================
+	# 종료 처리
+	# =============================================================================
 	@classmethod
 	def shutdown_all_adapters(cls):
-		"""모든 MCPServerAdapter 연결 종료"""
+		"""모든 MCPServerAdapter 연결을 안전하게 종료한다."""
 		for adapter in cls.adapters:
 			try:
 				adapter.stop()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import os
 import json
 import asyncio
@@ -8,14 +9,14 @@ from typing import Any, Tuple
 import openai
 from .logger import handle_application_error, write_log_message
 
+# =============================================================================
+# 요약기(Summarizer)
+# 설명: 출력/피드백/현재 내용으로부터 OpenAI를 사용해 간단 요약을 생성한다.
+# =============================================================================
 
 async def summarize_async(outputs: Any, feedbacks: Any, contents: Any = None) -> Tuple[str, str]:
-	"""출력과 피드백을 요약하여 (output_summary, feedback_summary)를 반환.
-
-	- OpenAI API 키가 없거나 오류 발생 시 빈 문자열로 폴백(로깅만 수행)
-	- 취소(asyncio.CancelledError)는 즉시 전파하여 상위에서 중단 처리
-	"""
-	# 단순/명시적 흐름: 값이 없으면 빈 문자열 반환, 예외는 상위로 전파
+	"""(output_summary, feedback_summary)를 비동기로 생성해 반환한다.
+	키 없음/오류 시 빈 문자열 폴백, 취소는 상위로 전파."""
 	outputs_str = _convert_to_string(outputs).strip()
 	feedbacks_str = _convert_to_string(feedbacks).strip()
 	contents_str = _convert_to_string(contents).strip()
@@ -34,10 +35,14 @@ async def summarize_async(outputs: Any, feedbacks: Any, contents: Any = None) ->
 		feedback_summary = await _call_openai_api_async(feedback_prompt, task_name="feedback")
 
 	return output_summary or "", feedback_summary or ""
-# 병렬/재시도 등 복잡 로직 제거. 단순 명확한 구현 유지
 
+
+# =============================================================================
+# 헬퍼: 문자열 변환
+# =============================================================================
 
 def _convert_to_string(data: Any) -> str:
+	"""임의 데이터를 안전하게 문자열로 변환한다."""
 	if data is None:
 		return ""
 	if isinstance(data, str):
@@ -48,7 +53,12 @@ def _convert_to_string(data: Any) -> str:
 		return str(data)
 
 
+# =============================================================================
+# 헬퍼: 프롬프트 생성
+# =============================================================================
+
 def _create_output_summary_prompt(outputs_str: str) -> str:
+	"""결과물 요약용 사용자 프롬프트를 생성한다."""
 	return (
 		"다음 작업 결과를 정리해주세요:\n\n"
 		f"{outputs_str}\n\n"
@@ -63,6 +73,7 @@ def _create_output_summary_prompt(outputs_str: str) -> str:
 
 
 def _create_feedback_summary_prompt(feedbacks_str: str, contents_str: str = "") -> str:
+	"""피드백/현재 결과물을 통합 요약하는 사용자 프롬프트를 생성한다."""
 	feedback_section = (
 		f"=== 피드백 내용 ===\n{feedbacks_str}" if feedbacks_str and feedbacks_str.strip() else ""
 	)
@@ -80,7 +91,12 @@ def _create_feedback_summary_prompt(feedbacks_str: str, contents_str: str = "") 
 	)
 
 
+# =============================================================================
+# 헬퍼: 시스템 프롬프트 선택
+# =============================================================================
+
 def _get_system_prompt(task_name: str) -> str:
+	"""작업 종류에 맞는 시스템 프롬프트를 반환한다."""
 	if task_name == "feedback":
 		return (
 			"당신은 피드백 정리 전문가입니다. 최신 피드백을 우선 반영하고,"
@@ -92,7 +108,17 @@ def _get_system_prompt(task_name: str) -> str:
 	)
 
 
+# =============================================================================
+# 외부 호출: OpenAI API
+# =============================================================================
+
 async def _call_openai_api_async(prompt: str, task_name: str) -> str:
+	"""OpenAI 비동기 API를 호출해 요약 텍스트를 생성한다."""
+	
+	if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY_BETA")):
+		write_log_message("요약 비활성화: OPENAI_API_KEY 미설정")
+		return ""
+
 	client = openai.AsyncOpenAI()
 	system_prompt = _get_system_prompt(task_name)
 	model = os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
@@ -114,9 +140,7 @@ async def _call_openai_api_async(prompt: str, task_name: str) -> str:
 		except Exception as e:
 			if attempt < 3:
 				handle_application_error("요약 호출 오류(재시도)", e, raise_error=False, extra={"attempt": attempt})
-				# 간단한 지수 백오프
 				await asyncio.sleep(0.8 * (2 ** (attempt - 1)))
 				continue
-			# 최종 실패 시 빈 문자열로 폴백
 			handle_application_error("요약 호출 최종 실패", e, raise_error=False)
 			return ""

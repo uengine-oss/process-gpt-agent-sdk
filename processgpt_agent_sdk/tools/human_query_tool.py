@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+# =============================================================================
+# Imports
+# =============================================================================
+
 import time
 import uuid
-import os
 from typing import Optional, List, Literal, Type, Dict, Any
+from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 from crewai.tools import BaseTool
 
-from ..utils.crewai_event_listener import CrewAIEventLogger
 from ..utils.context_manager import todo_id_var, proc_id_var, all_users_var
 from ..utils.logger import write_log_message, handle_application_error
-from ..core.database import fetch_human_response, save_notification
+from ..core.database import fetch_human_response_sync, save_notification, initialize_db, get_db_client
 
 
+# =============================================================================
+# 입력 스키마
+# =============================================================================
 class HumanQuerySchema(BaseModel):
-    """사용자 확인/추가정보 요청용 스키마"""
+    """사용자 확인/추가정보 요청 입력 스키마."""
 
     role: str = Field(..., description="누구에게(역할 또는 대상)")
     text: str = Field(..., description="질의 내용")
@@ -27,8 +33,12 @@ class HumanQuerySchema(BaseModel):
     )
 
 
+# =============================================================================
+# HumanQueryTool
+# 설명: 보안/모호성 관련 질문을 사용자에게 전송하고 응답을 동기 대기
+# =============================================================================
 class HumanQueryTool(BaseTool):
-    """사람에게 보안/모호성 관련 확인을 요청하고 응답을 대기하는 도구"""
+    """사람에게 질문을 보내고 응답을 동기적으로 대기한다."""
 
     name: str = "human_asked"
     description: str = (
@@ -95,6 +105,7 @@ class HumanQueryTool(BaseTool):
         agent_name: Optional[str] = None,
         **kwargs,
     ):
+        """도구 실행 컨텍스트(테넌트/유저/프로세스)를 옵션으로 설정."""
         super().__init__(**kwargs)
         self._tenant_id = tenant_id
         self._user_id = user_id
@@ -102,18 +113,19 @@ class HumanQueryTool(BaseTool):
         self._proc_inst_id = proc_inst_id
         self._agent_name = agent_name
 
-    # 동기 실행: CrewAI Tool 실행 컨텍스트에서 블로킹 폴링 허용
+    # =============================================================================
+    # 동기 실행
+    # 설명: 질문 이벤트를 저장하고 DB 폴링으로 응답을 기다린다
+    # =============================================================================
     def _run(
         self, role: str, text: str, type: str = "text", options: Optional[List[str]] = None
     ) -> str:
+        """질문 이벤트를 기록하고 최종 응답 문자열을 반환."""
         try:
-            # 초기화된 기본 agent_name 사용
             agent_name = getattr(self, "_agent_name", None)
-                
             write_log_message(f"HumanQueryTool 실행: role={role}, agent_name={agent_name}, type={type}, options={options}")
             query_id = f"human_asked_{uuid.uuid4()}"
 
-            # 이벤트 발행 데이터
             payload: Dict[str, Any] = {
                 "role": role,
                 "text": text,
@@ -121,31 +133,31 @@ class HumanQueryTool(BaseTool):
                 "options": options or [],
             }
 
-            # 컨텍스트 식별자
             todo_id = todo_id_var.get() or self._todo_id
             proc_inst_id = proc_id_var.get() or self._proc_inst_id
 
-            # 이벤트 발행
-            # 상태 정보는 data 안에 포함시켜 저장 (emit_event 시그니처에 status 없음)
             payload_with_status = {
                 **payload,
                 "status": "ASKED",
                 "agent_profile": "/images/chat-icon.png"
             }
-            ev = CrewAIEventLogger()
-            ev.emit_event(
-                event_type="human_asked",
-                data=payload_with_status,
-                job_id=query_id,
-                crew_type="action",
-                todo_id=str(todo_id) if todo_id is not None else None,
-                proc_inst_id=str(proc_inst_id) if proc_inst_id is not None else None,
-            )
+            
+            initialize_db()
+            supabase = get_db_client()
+            record = {
+                "id": str(uuid.uuid4()),
+                "job_id": query_id,
+                "todo_id": str(todo_id) if todo_id is not None else None,
+                "proc_inst_id": str(proc_inst_id) if proc_inst_id is not None else None,
+                "event_type": "human_asked",
+                "crew_type": "action",
+                "data": payload_with_status,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            supabase.table("events").insert(record).execute()
 
-            # 알림 저장 (notifications 테이블)
             try:
                 tenant_id = self._tenant_id
-                # 대상 이메일: context var(all_users_var)에 이메일 CSV가 있어야만 저장
                 target_emails_csv = all_users_var.get() or ""
                 if target_emails_csv and target_emails_csv.strip():
                     write_log_message(f"알림 저장 시도: target_emails_csv={target_emails_csv}, tenant_id={tenant_id}")
@@ -163,41 +175,37 @@ class HumanQueryTool(BaseTool):
             except Exception as e:
                 handle_application_error("알림저장HumanTool", e, raise_error=False)
 
-            # 응답 폴링 (events 테이블에서 동일 job_id, event_type=human_response)
             answer = self._wait_for_response(query_id)
             return answer
         except Exception as e:
-            # 사용자 미응답 또는 기타 에러 시에도 작업이 즉시 중단되지 않도록 문자열 반환
             handle_application_error("HumanQueryTool", e, raise_error=False)
             return "사용자 미응답 거절"
 
+    # =============================================================================
+    # 응답 대기
+    # 설명: events 테이블에서 human_response를 폴링하여 응답을 가져온다
+    # =============================================================================
     def _wait_for_response(
         self, job_id: str, timeout_sec: int = 180, poll_interval_sec: int = 5
     ) -> str:
-        """DB events 테이블을 폴링하여 사람의 응답을 기다림"""
+        """DB 폴링으로 사람의 응답을 기다려 문자열로 반환."""
         deadline = time.time() + timeout_sec
 
         while time.time() < deadline:
             try:
                 write_log_message(f"HumanQueryTool 응답 폴링: {job_id}")
-                event = fetch_human_response(job_id=job_id)
+                event = fetch_human_response_sync(job_id=job_id)
                 if event:
                     write_log_message(f"HumanQueryTool 응답 수신: {event}")
                     data = event.get("data") or {}
-                    # 기대 형식: {"answer": str, ...}
                     answer = (data or {}).get("answer")
                     if isinstance(answer, str):
                         write_log_message("사람 응답 수신 완료")
                         return answer
-                    # 문자열이 아니면 직렬화하여 반환
                     return str(data)
 
             except Exception as e:
-                # 응답이 아직 없는 경우(0개 행) 또는 기타 DB 오류 시 계속 폴링
                 write_log_message(f"인간 응답 대기 중... (오류: {str(e)[:100]})")
-
             time.sleep(poll_interval_sec)
-
-        # 타임아웃: 사용자 미응답으로 간주
         return "사용자 미응답 거절"
 

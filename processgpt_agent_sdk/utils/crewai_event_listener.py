@@ -21,6 +21,7 @@ class CrewAIEventLogger:
     # Initialization
     # =============================================================================
     def __init__(self):
+        """Supabase 클라이언트를 초기화한다."""
         initialize_db()
         self.supabase = get_db_client()
         write_log_message("CrewAIEventLogger 초기화 완료")
@@ -151,7 +152,6 @@ class CrewAIEventLogger:
             except Exception as e:
                 if attempt < 3:
                     handle_application_error("이벤트저장오류(재시도)", e, raise_error=False)
-                    # 지수 백오프: 0.3s, 0.6s
                     import time
                     time.sleep(0.3 * attempt)
                     continue
@@ -178,7 +178,10 @@ class CrewAIEventLogger:
             handle_application_error("이벤트처리오류", e, raise_error=False)
 
 
-
+# =============================================================================
+# CrewConfigManager
+# 설명: 이벤트 리스너를 프로세스 단위로 1회 등록
+# =============================================================================
 class CrewConfigManager:
     """글로벌 CrewAI 이벤트 리스너 등록 매니저"""
     _registered_by_pid: set[int] = set()
@@ -188,6 +191,7 @@ class CrewConfigManager:
         self._register_once_per_process()
 
     def _register_once_per_process(self) -> None:
+        """현재 프로세스에만 한 번 이벤트 리스너를 등록한다."""
         try:
             pid = os.getpid()
             if pid in self._registered_by_pid:

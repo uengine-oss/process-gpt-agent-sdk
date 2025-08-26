@@ -23,6 +23,10 @@ from .utils.event_handler import process_event_message
 from .utils.context_manager import set_context, reset_context
 
 
+# =============================================================================
+# 서버: ProcessGPTAgentServer
+# 설명: 작업 폴링→실행 준비→실행/이벤트 저장→취소 감시까지 담당하는 핵심 서버
+# =============================================================================
 class ProcessGPTAgentServer:
 	"""ProcessGPT 핵심 서버
 
@@ -31,6 +35,7 @@ class ProcessGPTAgentServer:
 	"""
 
 	def __init__(self, executor: AgentExecutor, polling_interval: int = 5, agent_orch: str = ""):
+		"""서버 실행기/폴링 주기/오케스트레이션 값을 초기화한다."""
 		self.polling_interval = polling_interval
 		self.is_running = False
 		self._executor: AgentExecutor = executor
@@ -39,6 +44,7 @@ class ProcessGPTAgentServer:
 		initialize_db()
 
 	async def run(self) -> None:
+		"""메인 폴링 루프를 실행한다. 작업을 가져와 준비/실행/감시를 순차 수행."""
 		self.is_running = True
 		write_log_message("ProcessGPT 서버 시작")
 		
@@ -64,7 +70,6 @@ class ProcessGPTAgentServer:
 						await update_task_error(str(task_id))
 					except Exception as upd_err:
 						handle_application_error("FAILED 상태 업데이트 실패", upd_err, raise_error=False)
-					# 다음 루프로 진행
 					continue
 				
 			except Exception as e:
@@ -72,10 +77,12 @@ class ProcessGPTAgentServer:
 				await asyncio.sleep(self.polling_interval)
 
 	def stop(self) -> None:
+		"""폴링 루프를 중지 플래그로 멈춘다."""
 		self.is_running = False
 		write_log_message("ProcessGPT 서버 중지")
 
 	async def _prepare_service_data(self, task_record: Dict[str, Any]) -> Dict[str, Any]:
+		"""실행에 필요한 데이터(에이전트/폼/요약/사용자)를 준비해 dict로 반환."""
 		done_outputs = await fetch_done_data(task_record.get("proc_inst_id"))
 		write_log_message(f"[PREP] done_outputs → {done_outputs}")
 		feedbacks = task_record.get("feedback")
@@ -121,12 +128,12 @@ class ProcessGPTAgentServer:
 		return prepared
 
 	async def _execute_with_cancel_watch(self, task_record: Dict[str, Any], prepared_data: Dict[str, Any]) -> None:
+		"""실행 태스크와 취소 감시 태스크를 동시에 운영한다."""
 		executor = self._executor
 
 		context = ProcessGPTRequestContext(prepared_data)
 		event_queue = ProcessGPTEventQueue(task_record)
 
-		# 실행 전 컨텍스트 변수 설정 (CrewAI 전역 리스너 등에서 활용)
 		try:
 			set_context(
 				todo_id=str(task_record.get("id")),
@@ -167,6 +174,7 @@ class ProcessGPTAgentServer:
 			write_log_message(f"[EXEC END] task_id={task_record.get('id')} agent={prepared_data.get('agent_orch','')}")
 
 	async def _watch_cancellation(self, task_record: Dict[str, Any], executor: AgentExecutor, context: RequestContext, event_queue: EventQueue, execute_task: asyncio.Task) -> None:
+		"""작업 상태를 주기적으로 확인해 취소 신호 시 안전 종료를 수행."""
 		todo_id = str(task_record.get("id"))
 		
 		while True:
@@ -192,34 +200,47 @@ class ProcessGPTAgentServer:
 						handle_application_error("취소 후 이벤트 큐 종료 실패", e, raise_error=False)
 				break
 
-
+# =============================================================================
+# 요청 컨텍스트: ProcessGPTRequestContext
+# 설명: 실행기에게 전달되는 요청 데이터/상태를 캡슐화
+# =============================================================================
 class ProcessGPTRequestContext(RequestContext):
 	def __init__(self, prepared_data: Dict[str, Any]):
+		"""실행에 필요한 데이터 묶음을 보관한다."""
 		self._prepared_data = prepared_data
 		self._message = prepared_data.get("message", "")
 		self._current_task = None
 
 	def get_user_input(self) -> str:
+		"""사용자 입력 메시지를 반환한다."""
 		return self._message
 
 	@property
 	def message(self) -> str:
+		"""현재 메시지(사용자 입력)를 반환한다."""
 		return self._message
 
 	@property
 	def current_task(self):
+		"""현재 실행 중 태스크(있다면)를 반환한다."""
 		return getattr(self, "_current_task", None)
 
 	def get_context_data(self) -> Dict[str, Any]:
+		"""실행 컨텍스트 전체 데이터를 dict로 반환한다."""
 		return self._prepared_data
 
-
+# =============================================================================
+# 이벤트 큐: ProcessGPTEventQueue
+# 설명: 실행기 이벤트를 내부 큐에 넣고, 비동기 처리 태스크를 생성해 저장 로직 호출
+# =============================================================================
 class ProcessGPTEventQueue(EventQueue):
 	def __init__(self, task_record: Dict[str, Any]):
+		"""현재 처리 중인 작업 레코드를 보관한다."""
 		self.todo = task_record
 		super().__init__()
 
 	def enqueue_event(self, event: Event):
+		"""이벤트를 큐에 넣고, 백그라운드로 DB 저장 코루틴을 실행한다."""
 		try:
 			try:
 				super().enqueue_event(event)
@@ -231,15 +252,18 @@ class ProcessGPTEventQueue(EventQueue):
 			handle_application_error("이벤트 저장 실패", e, raise_error=False)
 		
 	def task_done(self) -> None:
+		"""태스크 완료 로그를 남긴다."""
 		try:
 			write_log_message(f"태스크 완료: {self.todo['id']}")
 		except Exception as e:
 			handle_application_error("태스크 완료 처리 실패", e, raise_error=False)
 
 	async def close(self) -> None:
+		"""큐 종료 훅(필요 시 리소스 정리)."""
 		pass
 
 	def _create_bg_task(self, coro: Any, label: str) -> None:
+		"""백그라운드 태스크 생성 및 완료 콜백으로 예외 로깅."""
 		try:
 			task = asyncio.create_task(coro)
 			def _cb(t: asyncio.Task):
