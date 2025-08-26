@@ -1,35 +1,16 @@
-# ProcessGPT Agent Framework Dependencies
-
-# Supabase
+# Dev/testing convenience; runtime deps are in pyproject.toml
 supabase>=2.0.0
-
-# Environment management
 python-dotenv>=1.0.0
-
-# CLI interface
 click>=8.0.0
-
-# Async support
 asyncio-mqtt>=0.13.0
-
-# JSON handling
 jsonschema>=4.0.0
-
-# Logging
 structlog>=23.0.0
-
-# Type hints
 typing-extensions>=4.0.0
-
-# Date/time handling
 python-dateutil>=2.8.0
-
-# UUID support
-uuid>=1.30
-
-# Google A2A SDK (이 부분은 실제 SDK 이름에 맞게 조정 필요)
-# google-a2a-sdk>=1.0.0
-
-# Optional: Additional dependencies for specific agents
-# crewai>=0.1.0  # CrewAI agent용
-# langchain>=0.1.0  # LangChain 기반 agent용 
+openai>=1.40.0
+a2a-sdk==0.2.4
+mem0ai>=0.1.94
+vecs>=0.1.0
+mcp>=1.6.0
+crewai>=0.152.0
+crewai-tools[mcp]>=0.43.0

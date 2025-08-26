@@ -1,0 +1,3 @@
+include README.md
+include function.sql
+recursive-include processgpt_agent_sdk *.sql *.txt *.md
