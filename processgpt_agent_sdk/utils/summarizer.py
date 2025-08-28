@@ -24,12 +24,12 @@ async def summarize_async(outputs: Any, feedbacks: Any, contents: Any = None) ->
 	output_summary = ""
 	feedback_summary = ""
 
-	if outputs_str:
+	if outputs_str and outputs_str not in ("[]", "{}", "[{}]"):
 		write_log_message("요약 호출(이전결과물)")
 		output_prompt = _create_output_summary_prompt(outputs_str)
 		output_summary = await _call_openai_api_async(output_prompt, task_name="output")
 
-	if feedbacks_str or contents_str:
+	if feedbacks_str and feedbacks_str not in ("[]", "{}"):
 		write_log_message("요약 호출(피드백)")
 		feedback_prompt = _create_feedback_summary_prompt(feedbacks_str, contents_str)
 		feedback_summary = await _call_openai_api_async(feedback_prompt, task_name="feedback")

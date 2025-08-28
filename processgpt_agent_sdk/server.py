@@ -114,10 +114,11 @@ class ProcessGPTAgentServer:
 			"agent_list": agent_list or [],
 			"mcp_config": mcp_config,
 			"form_id": form_id,
+			"todo_id": str(task_record.get("id")),
 			"form_types": form_types or [],
 			"form_html": form_html or "",
 			"activity_name": str(task_record.get("activity_name", "")),
-			"message": str(task_record.get("description", "")),
+			"description": str(task_record.get("description", "")),
 			"agent_orch": str(task_record.get("agent_orch", "")),
 			"done_outputs": done_outputs or [],
 			"output_summary": output_summary or "",
@@ -132,7 +133,8 @@ class ProcessGPTAgentServer:
 		executor = self._executor
 
 		context = ProcessGPTRequestContext(prepared_data)
-		event_queue = ProcessGPTEventQueue(task_record)
+		loop = asyncio.get_running_loop()
+		event_queue = ProcessGPTEventQueue(task_record, loop=loop)
 
 		try:
 			set_context(
@@ -234,9 +236,10 @@ class ProcessGPTRequestContext(RequestContext):
 # 설명: 실행기 이벤트를 내부 큐에 넣고, 비동기 처리 태스크를 생성해 저장 로직 호출
 # =============================================================================
 class ProcessGPTEventQueue(EventQueue):
-	def __init__(self, task_record: Dict[str, Any]):
+	def __init__(self, task_record: Dict[str, Any], loop: asyncio.AbstractEventLoop | None = None):
 		"""현재 처리 중인 작업 레코드를 보관한다."""
 		self.todo = task_record
+		self._loop = loop
 		super().__init__()
 
 	def enqueue_event(self, event: Event):
@@ -263,13 +266,27 @@ class ProcessGPTEventQueue(EventQueue):
 		pass
 
 	def _create_bg_task(self, coro: Any, label: str) -> None:
-		"""백그라운드 태스크 생성 및 완료 콜백으로 예외 로깅."""
+		"""백그라운드 태스크 생성 및 완료 콜백으로 예외 로깅.
+
+		- 실행 중인 이벤트 루프가 없을 때도 전달된 루프에 안전하게 예약한다.
+		"""
 		try:
-			task = asyncio.create_task(coro)
+			loop = self._loop
+			if loop is None:
+				try:
+					loop = asyncio.get_running_loop()
+				except RuntimeError:
+					raise
+
 			def _cb(t: asyncio.Task):
 				exc = t.exception()
 				if exc:
 					handle_application_error(f"백그라운드 태스크 오류({label})", exc, raise_error=False)
-			task.add_done_callback(_cb)
+
+			def _schedule():
+				task = loop.create_task(coro)
+				task.add_done_callback(_cb)
+
+			loop.call_soon_threadsafe(_schedule)
 		except Exception as e:
 			handle_application_error(f"백그라운드 태스크 생성 실패({label})", e, raise_error=False)
