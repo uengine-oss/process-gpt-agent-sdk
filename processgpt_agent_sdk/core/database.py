@@ -103,16 +103,30 @@ def get_consumer_id() -> str:
 async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict[str, Any]]:
     """TODOLIST 테이블에서 대기중인 워크아이템을 조회"""
     def _call():
-        client = get_db_client()
-        return client.rpc(
-            "fetch_pending_task",
-            {"p_agent_orch": agent_orch, "p_consumer": consumer, "p_limit": 1},
-        ).execute()
+        supabase = get_db_client()
+        consumer_id = socket.gethostname()
+        env = (os.getenv("ENV") or "").lower()
+
+        if env == "dev":
+            # 개발 환경: 특정 테넌트(uengine)만 폴링
+            resp = supabase.rpc(
+                "fetch_pending_task_dev",
+                {"p_limit": 1, "p_consumer": consumer_id, "p_tenant_id": "uengine"},
+            ).execute()
+        else:
+            # 운영/기타 환경: 기존 로직 유지
+            resp = supabase.rpc(
+                "fetch_pending_task",
+                {"p_limit": 1, "p_consumer": consumer_id},
+            ).execute()
+
+        rows = resp.data or []
+        return rows[0] if rows else None
 
     resp = await _async_retry(_call, name="polling_pending_todos", fallback=lambda: None)
-    if not resp or not resp.data:
+    if not resp:
         return None
-    return resp.data[0]
+    return resp
 
 
 async def fetch_todo_by_id(todo_id: str) -> Optional[Dict[str, Any]]:
@@ -142,7 +156,7 @@ async def fetch_done_data(proc_inst_id: Optional[str]) -> List[Any]:
     resp = await _async_retry(_call, name="fetch_done_data", fallback=lambda: None)
     if not resp:
         return []
-    return [row.get("output") for row in (resp.data or [])]
+    return [row.get("output") for row in (resp.data or []) if row.get("output")]
 
 
 def fetch_human_response_sync(job_id: str) -> Optional[Dict[str, Any]]:
@@ -359,20 +373,10 @@ async def fetch_human_users_by_proc_inst_id(proc_inst_id: str) -> str:
 # 데이터 저장
 # 설명: 이벤트/알림/작업 결과 저장
 # ============================================================================
-async def record_event(todo: Dict[str, Any], data: Dict[str, Any], event_type: Optional[str] = None) -> None:
-    """UI용 events 테이블에 이벤트 기록"""
+async def record_event(payload: Dict[str, Any]) -> None:
+    """UI용 events 테이블에 이벤트 기록 (전달된 payload 그대로 저장)"""
     def _call():
         client = get_db_client()
-        payload: Dict[str, Any] = {
-            "id": str(uuid.uuid4()),
-            "job_id": todo.get("proc_inst_id") or str(todo.get("id")),
-            "todo_id": str(todo.get("id")),
-            "proc_inst_id": todo.get("proc_inst_id"),
-            "crew_type": todo.get("agent_orch"),
-            "data": data,
-        }
-        if event_type is not None:
-            payload["event_type"] = event_type
         return client.table("events").insert(payload).execute()
 
     resp = await _async_retry(_call, name="record_event", fallback=lambda: None)
