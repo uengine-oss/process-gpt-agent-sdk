@@ -1,3 +1,5 @@
+배포: ./release.sh 0.2.8 (버전은 pyproject.toml에서 확인 후 진행) 조금이라도 수정을 했다면, 버전은 계속 올려가면서 진행해야합니다.
+
 # ProcessGPT Agent Framework
 
 Google A2A SDK의 인터페이스를 활용하면서 웹소켓 대신 Supabase 실시간 DB를 사용하는 에이전트 실행 프레임워크입니다.
