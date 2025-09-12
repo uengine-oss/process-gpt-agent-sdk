@@ -17,7 +17,7 @@ from .core.database import (
 	update_task_error,
 )
 
-from .utils.logger import handle_application_error, write_log_message
+from .utils.logger import handle_application_error, write_log_message, write_debug_message, write_info_message, DEBUG_LEVEL_BASIC, DEBUG_LEVEL_DETAILED, DEBUG_LEVEL_VERBOSE
 from .utils.summarizer import summarize_async
 from .utils.event_handler import process_event_message
 from .utils.context_manager import set_context, reset_context
@@ -47,24 +47,33 @@ class ProcessGPTAgentServer:
 		"""메인 폴링 루프를 실행한다. 작업을 가져와 준비/실행/감시를 순차 수행."""
 		self.is_running = True
 		write_log_message("ProcessGPT 서버 시작")
+		write_debug_message(f"[DEBUG-001] 서버 초기화 완료 - polling_interval={self.polling_interval}s, agent_orch='{self.agent_orch}', cancel_check_interval={self.cancel_check_interval}s", DEBUG_LEVEL_BASIC)
 		
 		while self.is_running:
 			try:
+				write_debug_message(f"[DEBUG-002] 폴링 시작 - agent_orch='{self.agent_orch}', consumer_id={get_consumer_id()}", DEBUG_LEVEL_VERBOSE)
 				task_record = await polling_pending_todos(self.agent_orch, get_consumer_id())
 				if not task_record:
+					write_debug_message(f"[DEBUG-003] 대기 중인 작업 없음 - {self.polling_interval}초 후 재시도", DEBUG_LEVEL_VERBOSE)
 					await asyncio.sleep(self.polling_interval)
 					continue
 
 				task_id = task_record["id"]
 				write_log_message(f"[JOB START] task_id={task_id}")
+				write_debug_message(f"[DEBUG-004] 작업 레코드 수신 - task_id={task_id}, proc_inst_id={task_record.get('proc_inst_id')}, user_id={task_record.get('user_id')}, tenant_id={task_record.get('tenant_id')}, activity_name={task_record.get('activity_name')}", DEBUG_LEVEL_BASIC)
 
 				try:
+					write_debug_message(f"[DEBUG-005] 서비스 데이터 준비 시작 - task_id={task_id}", DEBUG_LEVEL_DETAILED)
 					prepared_data = await self._prepare_service_data(task_record)
 					write_log_message(f"[RUN] 서비스 데이터 준비 완료 [task_id={task_id} agent={prepared_data.get('agent_orch','')}]")
+					write_debug_message(f"[DEBUG-006] 준비된 데이터 요약 - agent_list_count={len(prepared_data.get('agent_list', []))}, form_types_count={len(prepared_data.get('form_types', []))}, done_outputs_count={len(prepared_data.get('done_outputs', []))}, all_users_count={len(prepared_data.get('all_users', []))}", DEBUG_LEVEL_DETAILED)
 
+					write_debug_message(f"[DEBUG-007] 실행 및 취소 감시 시작 - task_id={task_id}", DEBUG_LEVEL_BASIC)
 					await self._execute_with_cancel_watch(task_record, prepared_data)
 					write_log_message(f"[RUN] 서비스 실행 완료 [task_id={task_id} agent={prepared_data.get('agent_orch','')}]")
+					write_debug_message(f"[DEBUG-008] 작업 완료 처리 - task_id={task_id}", DEBUG_LEVEL_BASIC)
 				except Exception as job_err:
+					write_debug_message(f"[DEBUG-009] 작업 처리 중 예외 발생 - task_id={task_id}, error_type={type(job_err).__name__}, error_message={str(job_err)}", DEBUG_LEVEL_BASIC)
 					handle_application_error("작업 처리 오류", job_err, raise_error=False)
 					try:
 						await update_task_error(str(task_id))
@@ -148,15 +157,20 @@ class ProcessGPTAgentServer:
 			handle_application_error("컨텍스트 설정 실패", e, raise_error=False)
 
 		write_log_message(f"[EXEC START] task_id={task_record.get('id')} agent={prepared_data.get('agent_orch','')}")
+		write_debug_message(f"[DEBUG-010] 실행기 및 이벤트 큐 초기화 완료 - task_id={task_record.get('id')}, context_data_keys={list(context.get_context_data().keys())}, event_queue_type={type(event_queue).__name__}", DEBUG_LEVEL_DETAILED)
 		execute_task = asyncio.create_task(executor.execute(context, event_queue))
 		cancel_watch_task = asyncio.create_task(self._watch_cancellation(task_record, executor, context, event_queue, execute_task))
+		write_debug_message(f"[DEBUG-011] 비동기 태스크 생성 완료 - execute_task={execute_task.get_name()}, cancel_watch_task={cancel_watch_task.get_name()}", DEBUG_LEVEL_DETAILED)
 		
 		try:
+			write_debug_message(f"[DEBUG-012] 태스크 대기 시작 - task_id={task_record.get('id')}", DEBUG_LEVEL_VERBOSE)
 			done, pending = await asyncio.wait(
 				[cancel_watch_task, execute_task], 
 				return_when=asyncio.FIRST_COMPLETED
 			)
+			write_debug_message(f"[DEBUG-013] 태스크 완료 감지 - done_count={len(done)}, pending_count={len(pending)}", DEBUG_LEVEL_VERBOSE)
 			for task in pending:
+				write_debug_message(f"[DEBUG-014] 대기 중인 태스크 취소 - task_name={task.get_name()}", DEBUG_LEVEL_VERBOSE)
 				task.cancel()
 				
 		except Exception as e:
@@ -184,8 +198,10 @@ class ProcessGPTAgentServer:
 			
 			status = await fetch_task_status(todo_id)
 			normalized = (status or "").strip().lower()
+			write_debug_message(f"[DEBUG-015] 취소 상태 확인 - todo_id={todo_id}, status='{status}', normalized='{normalized}', check_interval={self.cancel_check_interval}s", DEBUG_LEVEL_VERBOSE)
 			if normalized in ("cancelled", "fb_requested"):
 				write_log_message(f"작업 취소 감지: {todo_id}, 상태: {status}")
+				write_debug_message(f"[DEBUG-016] 취소 처리 시작 - todo_id={todo_id}, status='{status}', normalized='{normalized}'", DEBUG_LEVEL_BASIC)
 				
 				try:
 					await executor.cancel(context, event_queue)
@@ -245,13 +261,18 @@ class ProcessGPTEventQueue(EventQueue):
 	def enqueue_event(self, event: Event):
 		"""이벤트를 큐에 넣고, 백그라운드로 DB 저장 코루틴을 실행한다."""
 		try:
+			write_debug_message(f"[DEBUG-017] 이벤트 큐 삽입 시작 - todo_id={self.todo.get('id')}, event_type={type(event).__name__}", DEBUG_LEVEL_VERBOSE)
 			try:
 				super().enqueue_event(event)
+				write_debug_message(f"[DEBUG-018] 이벤트 큐 삽입 성공 - todo_id={self.todo.get('id')}, event_type={type(event).__name__}", DEBUG_LEVEL_VERBOSE)
 			except Exception as e:
+				write_debug_message(f"[DEBUG-019] 이벤트 큐 삽입 실패 - todo_id={self.todo.get('id')}, error={str(e)}", DEBUG_LEVEL_BASIC)
 				handle_application_error("이벤트 큐 삽입 실패", e, raise_error=False)
 
+			write_debug_message(f"[DEBUG-020] 백그라운드 이벤트 처리 태스크 생성 - todo_id={self.todo.get('id')}", DEBUG_LEVEL_VERBOSE)
 			self._create_bg_task(process_event_message(self.todo, event), "process_event_message")
 		except Exception as e:
+			write_debug_message(f"[DEBUG-021] 이벤트 저장 전체 실패 - todo_id={self.todo.get('id')}, error={str(e)}", DEBUG_LEVEL_BASIC)
 			handle_application_error("이벤트 저장 실패", e, raise_error=False)
 		
 	def task_done(self) -> None:
