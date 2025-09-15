@@ -6,13 +6,37 @@ from typing import Optional, Dict
 
 # Configure root logger only once (idempotent)
 if not logging.getLogger().handlers:
+	# LOG_LEVEL 환경변수 읽기
+	log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+	if log_level == "DEBUG":
+		level = logging.DEBUG
+	elif log_level == "INFO":
+		level = logging.INFO
+	elif log_level == "WARNING":
+		level = logging.WARNING
+	elif log_level == "ERROR":
+		level = logging.ERROR
+	else:
+		level = logging.INFO
+	
 	logging.basicConfig(
-		level=logging.INFO,
+		level=level,
 		format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 	)
 
 LOGGER_NAME = os.getenv("LOGGER_NAME") or "processgpt"
 APPLICATION_LOGGER = logging.getLogger(LOGGER_NAME)
+
+# Application logger도 같은 레벨로 설정
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+if log_level == "DEBUG":
+	APPLICATION_LOGGER.setLevel(logging.DEBUG)
+elif log_level == "INFO":
+	APPLICATION_LOGGER.setLevel(logging.INFO)
+elif log_level == "WARNING":
+	APPLICATION_LOGGER.setLevel(logging.WARNING)
+elif log_level == "ERROR":
+	APPLICATION_LOGGER.setLevel(logging.ERROR)
 
 # 디버그 레벨 상수 정의
 DEBUG_LEVEL_NONE = 0      # 디버그 로그 없음
