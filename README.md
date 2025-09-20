@@ -28,7 +28,7 @@ Google A2A SDK의 인터페이스를 활용하면서 웹소켓 대신 Supabase �
 ### 패키지 설치
 
 ```
-pip install process-gpt-sdk
+pip install process-gpt-agent-sdk
 ```
 
 ### 1. AgentExecutor 구현
