@@ -206,23 +206,6 @@ $$ LANGUAGE plpgsql VOLATILE;
 
 
 -- 2) 완료된 데이터(output/feedback) 조회
-DROP FUNCTION IF EXISTS public.fetch_done_data(text);
-
-CREATE OR REPLACE FUNCTION public.fetch_done_data(
-  p_proc_inst_id text
-)
-RETURNS TABLE (
-  output jsonb
-)
-LANGUAGE SQL
-AS $$
-  SELECT t.output
-    FROM public.todolist AS t
-   WHERE t.proc_inst_id = p_proc_inst_id
-     AND t.status = 'DONE'
-     AND t.output IS NOT NULL
-   ORDER BY t.start_date;
-$$;
 
 -- 3) 결과 저장 (중간/최종)
 CREATE OR REPLACE FUNCTION public.save_task_result(
@@ -265,5 +248,4 @@ $$ LANGUAGE plpgsql VOLATILE;
 -- 익명(anon) 역할에 실행 권한 부여
 GRANT EXECUTE ON FUNCTION public.fetch_pending_task(text, text, integer) TO anon;
 GRANT EXECUTE ON FUNCTION public.fetch_pending_task_dev(text, text, integer, text) TO anon;
-GRANT EXECUTE ON FUNCTION public.fetch_done_data(text) TO anon;
 GRANT EXECUTE ON FUNCTION public.save_task_result(uuid, jsonb, boolean) TO anon;
