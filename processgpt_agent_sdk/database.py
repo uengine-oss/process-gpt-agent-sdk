@@ -277,6 +277,7 @@ async def fetch_agent_data(user_ids: str) -> List[Dict[str, Any]]:
                     "profile": row.get("profile"),
                     "model": row.get("model"),
                     "tenant_id": row.get("tenant_id"),
+                    "endpoint": row.get("endpoint"),
                 }
             )
         return normalized
