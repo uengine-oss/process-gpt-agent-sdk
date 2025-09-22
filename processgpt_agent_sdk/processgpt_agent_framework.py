@@ -17,7 +17,7 @@ from a2a.types import (
 )
 
 # DB 어댑터 사용
-from database import (
+from .database import (
     initialize_db,
     polling_pending_todos,
     record_event,

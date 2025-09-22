@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "process-gpt-agent-sdk"
-version = "0.3.11"
+version = "0.3.12"
 description = "Supabase 기반 이벤트/작업 폴링으로 A2A AgentExecutor를 실행하는 SDK"
 readme = "README.md"
 requires-python = ">=3.9"
