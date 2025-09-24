@@ -19,9 +19,9 @@ class MinimalExecutor(AgentExecutor):
         context_id = row.get("root_proc_inst_id") or row.get("proc_inst_id")
         task_id = row.get("id")
         
-        # 🧪 테스트용 강제 오류 발생
-        print("🧪 테스트용 강제 오류 발생!")
-        raise RuntimeError("MinimalExecutor에서 발생한 테스트용 오류")
+        # # 🧪 테스트용 강제 오류 발생
+        # print("🧪 테스트용 강제 오류 발생!")
+        # raise RuntimeError("MinimalExecutor에서 발생한 테스트용 오류")
 
         # 1) 진행 상태 이벤트 (events 저장, data=문자열)
         # 결과 본문(JSON)을 그대로 보내되, Message 스키마 요구로 문자열로 직렬화

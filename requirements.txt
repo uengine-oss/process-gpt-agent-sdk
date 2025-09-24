@@ -1,11 +1,8 @@
+# Core
 supabase>=2.0.0
+openai>=1.30.0
 python-dotenv>=1.0.0
-click>=8.0.0
-asyncio-mqtt>=0.13.0
-jsonschema>=4.0.0
-structlog>=23.0.0
-typing-extensions>=4.0.0
-python-dateutil>=2.8.0
-dotenv>=0.19.0
 a2a-sdk==0.3.0
-python-dotenv>=1.0.0
+
+# Python <3.11 환경 호환(선택)
+typing-extensions>=4.0.0

@@ -16,7 +16,6 @@ Supabase 기반의 프로세스 작업(Todolist)을 폴링하고, A2A 규격 이
 |------------|------|-----------|----------------|
 | `task_started` | 작업 시작 | 작업 처리 시작시 | 수동 설정 |
 | `task_completed` | 작업 완료 | 작업 정상 완료시 | 수동 설정 |
-| `crew_completed` | 크루 작업 완료 | 서버가 작업 종료시 | **자동 설정** |
 | `tool_usage_started` | 도구 사용 시작 | 외부 도구/API 호출 시작 | 수동 설정 |
 | `tool_usage_finished` | 도구 사용 완료 | 외부 도구/API 호출 완료 | 수동 설정 |
 | `human_asked` | 사용자 입력 요청 | HITL 패턴 사용시 | **자동 설정** |
@@ -638,3 +637,7 @@ python my_server.py
 - **TaskStatusUpdateEvent** → `events` 테이블 (`data` 컬럼)
 - **TaskArtifactUpdateEvent** → `todolist` 테이블 (`output` 컬럼)
 - 래퍼 자동 제거 후 순수 payload만 저장
+
+
+## 버전업
+./release.sh 버전
