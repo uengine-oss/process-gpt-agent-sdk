@@ -23,7 +23,7 @@ from .database import (
     get_consumer_id,
     fetch_context_bundle,
 )
-from .utils import summarize_error_to_user
+from .utils import summarize_error_to_user, summarize_feedback
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -134,7 +134,17 @@ class ProcessGPTRequestContext(RequestContext):
             # 사용자 친화 요약은 상위 경계에서 한 번만 기록하도록 넘김
             raise ContextPreparationError(e)
 
-        # 3단계: 컨텍스트 구성
+        # 3단계: 피드백 요약 처리
+        logger.info("📝 피드백 요약 처리 중...")
+        feedback_str = self.row.get("feedback", "")
+        contents_str = self.row.get("output", "") or self.row.get("draft", "")
+        summarized_feedback = ""
+
+        if feedback_str.strip():
+            summarized_feedback = await summarize_feedback(feedback_str, contents_str)
+            logger.info("✅ 피드백 요약 완료 - 원본: %d자 → 요약: %d자", len(feedback_str), len(summarized_feedback))
+
+        # 4단계: 컨텍스트 구성
         logger.info("🏗️ 컨텍스트 구성 중...")
         self._extra_context = {
             "id": self.row.get("id"),
@@ -147,6 +157,7 @@ class ProcessGPTRequestContext(RequestContext):
             "form_html": form_html,
             "form_id": form_id,
             "notify_user_emails": notify_emails,
+            "summarized_feedback": summarized_feedback,
         }
         
         logger.info("✅ 컨텍스트 준비 완료! (agents=%d개)", 
