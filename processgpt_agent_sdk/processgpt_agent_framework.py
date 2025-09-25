@@ -93,7 +93,7 @@ class TodoListRowContext:
 class ProcessGPTRequestContext(RequestContext):
     def __init__(self, row: Dict[str, Any]):
         self.row = row
-        self._user_input = (row.get("description") or "").strip()
+        self._user_input = (row.get("query") or "").strip()
         self._message = self._user_input
         self._current_task = None
         self._task_state = row.get("draft_status") or ""
@@ -124,9 +124,10 @@ class ProcessGPTRequestContext(RequestContext):
             )
             form_id, form_fields, form_html = form_tuple
             
-            logger.info("📦 컨텍스트 번들 조회 완료 - agents: %d개, notify_emails: %s", 
+            logger.info("📦 컨텍스트 번들 조회 완료 - agents: %d개, notify_emails: %s, form_type: %s", 
                        len(agents) if isinstance(agents, list) else 0, 
-                       "있음" if notify_emails else "없음")
+                       "있음" if notify_emails else "없음",
+                       "자유형식" if form_id == "freeform" else "정의된 폼")
             
         except Exception as e:
             logger.error("❌ 컨텍스트 번들 조회 실패: %s", str(e))

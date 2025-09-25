@@ -157,8 +157,14 @@ async def fetch_context_bundle(
         notify = (row.get("notify_emails") or "").strip()
         mcp = row.get("tenant_mcp") or None
         form_id = row.get("form_id")
-        form_fields = row.get("form_fields") or [{"key": form_id, "type": "default", "text": ""}]
+        form_fields = row.get("form_fields")
         form_html = row.get("form_html")
+        
+        # form 정보가 없는 경우 자유형식 폼으로 처리
+        if not form_id or not form_fields:
+            form_id = "freeform"
+            form_fields = [{"key": "freeform", "type": "textarea", "text": "자유형식 입력", "placeholder": "원하는 내용을 자유롭게 입력해주세요."}]
+            form_html = None
         agents = row.get("agents") or []
         return notify, mcp, (form_id, form_fields, form_html), agents
 
