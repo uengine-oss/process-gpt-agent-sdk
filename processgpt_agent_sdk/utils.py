@@ -2,14 +2,12 @@ import os
 import logging
 import traceback
 from typing import Any, Dict, Optional, List
+from typing import Iterable, Union
+from openai import AsyncOpenAI
 
-try:
-    # 비동기 클라이언트 사용 → 이벤트 루프 블로킹 방지
-    from openai import AsyncOpenAI
-except Exception:
-    AsyncOpenAI = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
 
 # ─────────────────────────────
 # Lazy Singleton OpenAI Client
@@ -119,19 +117,18 @@ async def summarize_error_to_user(exc: Exception, meta: Dict[str, Any]) -> str:
         # 폴백 없이 상위 전파
         raise
 
-async def summarize_feedback(feedback_str: str, contents_str: str = "") -> str:
+async def summarize_feedback(feedback_data: List[dict], content_data: dict = {}) -> str:
     """
     피드백과 결과물을 바탕으로 통합된 피드백 요약을 생성.
     - 모델: gpt-4.1-nano (환경변수 FEEDBACK_SUMMARY_MODEL로 재정의 가능)
     - 폴백: 없음 (LLM 실패 시 예외를 상위로 전파)
     """
     logger.info(
-        "🔍 피드백 요약 처리 시작 | 피드백: %d자, 결과물: %d자",
-        len(feedback_str or ""), len(contents_str or "")
-    )
+        "🔍 피드백 요약 처리 시작 | 피드백: %s, 결과물: %s자",
+        feedback_data, content_data)
 
     system_prompt = _get_feedback_system_prompt()
-    user_prompt = _create_feedback_summary_prompt(feedback_str, contents_str)
+    user_prompt = _create_feedback_summary_prompt(feedback_data, content_data)
 
     try:
         text = await _llm_request(system_prompt, user_prompt, "FEEDBACK_SUMMARY_MODEL", "gpt-4.1-nano")
@@ -145,13 +142,13 @@ async def summarize_feedback(feedback_str: str, contents_str: str = "") -> str:
 # ─────────────────────────────
 # 프롬프트 유틸
 # ─────────────────────────────
-def _create_feedback_summary_prompt(feedbacks_str: str, contents_str: str = "") -> str:
+def _create_feedback_summary_prompt(feedback_data: List[dict], content_data: dict = {}) -> str:
     """피드백 정리 프롬프트 - 현재 결과물과 피드백을 함께 분석"""
     blocks: List[str] = ["다음은 사용자의 피드백과 결과물입니다. 이를 분석하여 통합된 피드백을 작성해주세요:"]
-    if feedbacks_str and feedbacks_str.strip():
-        blocks.append(f"=== 피드백 내용 ===\n{feedbacks_str}")
-    if contents_str and contents_str.strip():
-        blocks.append(f"=== 현재 결과물/작업 내용 ===\n{contents_str}")
+    if feedback_data:
+        blocks.append(f"=== 피드백 내용 ===\n{feedback_data}")
+    if content_data:
+        blocks.append(f"=== 현재 결과물/작업 내용 ===\n{content_data}")
 
     blocks.append(
         """**상황 분석 및 처리 방식:**

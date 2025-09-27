@@ -156,7 +156,7 @@ BEGIN
     SELECT unnest(string_to_array(COALESCE(p_user_ids, ''), ',')) AS idtxt
   ),
   valid_ids AS (
-    SELECT idtxt FROM want_ids WHERE idtxt ~* '^[0-9a-f-]{8}-[0-9a-f-]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    SELECT idtxt FROM want_ids WHERE idtxt ~* '^[0-9a-f-]{8}-[0-9a-f-]{4}-[0-9a-f-]{4}-[0-9a-f-]{4}-[0-9a-f]{12}$'
   )
   SELECT jsonb_agg(to_jsonb(u))
     INTO agents

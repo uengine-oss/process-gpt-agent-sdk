@@ -130,57 +130,27 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
         ).execute()
 
         rows = resp.data or []
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        
+        row = rows[0]
+        # 빈 값들을 NULL로 변환
+        if row.get("feedback") in ([], {}):
+            row["feedback"] = None
+        if row.get("output") in ([], {}):
+            row["output"] = None
+        if row.get("draft") in ([], {}):
+            row["draft"] = None
+            
+        return row
 
     return await _async_retry(_call, name="polling_pending_todos", fallback=lambda: None)
 
-# ------------------------------ Context Bundle ------------------------------
-async def fetch_context_bundle(
-    proc_inst_id: str,
-    tenant_id: str,
-    tool_val: str,
-    user_ids: str,
-) -> Tuple[str, Optional[Dict[str, Any]], Tuple[Optional[str], List[Dict[str, Any]], Optional[str]], List[Dict[str, Any]]]:
-    def _call():
-        client = get_db_client()
-        resp = client.rpc(
-            "fetch_context_bundle",
-            {
-                "p_proc_inst_id": proc_inst_id or "",
-                "p_tenant_id": tenant_id or "",
-                "p_tool": tool_val or "",
-                "p_user_ids": user_ids or "",
-            },
-        ).execute()
-        rows = resp.data or []
-        row = rows[0] if rows else {}
-        notify = (row.get("notify_emails") or "").strip()
-        mcp = row.get("tenant_mcp") or None
-        form_id = row.get("form_id")
-        form_fields = row.get("form_fields")
-        form_html = row.get("form_html")
-        
-        # form 정보가 없는 경우 자유형식 폼으로 처리
-        if not form_id or not form_fields:
-            form_id = "freeform"
-            form_fields = [{"key": "freeform", "type": "textarea", "text": "자유형식 입력", "placeholder": "원하는 내용을 자유롭게 입력해주세요."}]
-            form_html = None
-        agents = row.get("agents") or []
-        return notify, mcp, (form_id, form_fields, form_html), agents
-
-    try:
-        return await _async_retry(_call, name="fetch_context_bundle", fallback=lambda: ("", None, (None, [], None), []))
-    except Exception as e:
-        logger.error("fetch_context_bundle fatal: %s", str(e), exc_info=e)
-        return ("", None, (None, [], None), [])
 
 # ------------------------------ Events & Results ------------------------------
 async def record_events_bulk(payloads: List[Dict[str, Any]]) -> None:
-    """
-    이벤트 다건 저장:
-    - 성공: 'record_events_bulk ok'
-    - 실패(최종): '❌ record_events_bulk failed' (개수 포함)
-    """
+    """이벤트 다건 저장 함수"""
+
     if not payloads:
         return
 
@@ -202,12 +172,8 @@ async def record_events_bulk(payloads: List[Dict[str, Any]]) -> None:
         logger.info("record_events_bulk ok: count=%d", len(safe_list))
 
 async def record_event(payload: Dict[str, Any]) -> None:
-    """
-    단건 이벤트 저장.
-    - 성공: 'record_event ok'
-    - 실패(최종): '❌ record_event failed'
-    - 실패해도 워크플로우는 계속(요청사항)
-    """
+    """단건 이벤트 저장 함수"""
+
     if not payload:
         return
 
@@ -225,6 +191,8 @@ async def record_event(payload: Dict[str, Any]) -> None:
         logger.info("record_event ok: event_type=%s", payload.get("event_type"))
 
 async def save_task_result(todo_id: str, result: Any, final: bool = False) -> None:
+    """결과 저장 함수"""
+
     if not todo_id:
         logger.error("save_task_result invalid todo_id: %s", str(todo_id))
         return
@@ -251,6 +219,8 @@ async def save_task_result(todo_id: str, result: Any, final: bool = False) -> No
 
 # ------------------------------ Failure Status ------------------------------
 async def update_task_error(todo_id: str) -> None:
+    """작업 실패 상태 업데이트 함수"""
+
     if not todo_id:
         return
 
@@ -263,3 +233,151 @@ async def update_task_error(todo_id: str) -> None:
         logger.error("❌ update_task_error failed todo_id=%s", todo_id)
     else:
         logger.info("update_task_error ok todo_id=%s", todo_id)
+
+# ============================== Prepare Context ==============================
+
+from typing import Any, Dict, List, Optional, Tuple
+
+async def fetch_form_def(tool_val: str, tenant_id: str) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+    """폼 정의 조회 함수"""
+    form_id = (tool_val or "").replace("formHandler:", "", 1)
+
+    def _call():
+        client = get_db_client()
+        resp = (
+            client.table("form_def")
+            .select("fields_json, html")
+            .eq("id", form_id)
+            .eq("tenant_id", tenant_id or "")
+            .execute()
+        )
+        data = (resp.data or [])
+        if not data:
+            return None
+
+        row = data[0]
+        return {
+            "fields": row.get("fields_json"),
+            "html": row.get("html"),
+        }
+
+    try:
+        res = await _async_retry(_call, name="fetch_form_def")
+    except Exception as e:
+        logger.error("fetch_form_def fatal: %s", str(e), exc_info=e)
+        res = None
+
+    if not res or not res.get("fields"):
+        # 기본(자유형식) 폼
+        return (
+            form_id or "freeform",
+            [{"key": "freeform", "type": "textarea", "text": "자유형식 입력", "placeholder": "원하는 내용을 자유롭게 입력해주세요."}],
+            None,
+        )
+    return (form_id or "freeform", res["fields"], res.get("html"))
+
+
+async def fetch_users_grouped(user_ids: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """해당 todo에서 사용자 목록과 에이전트 목록 조회하는는 함수"""
+    ids = [u for u in (user_ids or []) if u]
+    if not ids:
+        return ([], [])
+
+    def _call():
+        client = get_db_client()
+        resp = (
+            client.table("users")
+            .select("*")
+            .in_("id", ids)
+            .execute()
+        )
+        rows = resp.data or []
+        return rows
+
+    try:
+        rows = await _async_retry(_call, name="fetch_users_grouped", fallback=lambda: [])
+    except Exception as e:
+        logger.error("fetch_users_grouped fatal: %s", str(e), exc_info=e)
+        rows = []
+
+    agents, users = [], []
+    for r in rows:
+        if r.get("is_agent") is True:
+            agents.append(r)
+        else:
+            users.append(r)
+    return (agents, users)
+
+async def fetch_email_users_by_proc_inst_id(proc_inst_id: str) -> str:
+    """proc_inst_id로 이메일 수집(사람만): todolist → users(in) 한 번에"""
+    if not proc_inst_id:
+        return ""
+
+    def _call():
+        client = get_db_client()
+        # 3-1) 해당 인스턴스의 user_id 수집(중복 제거)
+        tl = (
+            client.table("todolist")
+            .select("user_id")
+            .eq("proc_inst_id", proc_inst_id)
+            .execute()
+        )
+        ids_set = set()
+        for row in (tl.data or []):
+            uid_csv = (row.get("user_id") or "").strip()
+            if not uid_csv:
+                continue
+            # user_id는 문자열 CSV라고 전제
+            for uid in uid_csv.split(","):
+                u = uid.strip()
+                if u:
+                    ids_set.add(u)
+        if not ids_set:
+            return []
+
+        # 3-2) 한 번의 IN 조회로 사람만 이메일 추출
+        ur = (
+            client.table("users")
+            .select("id, email, is_agent")
+            .in_("id", list(ids_set))
+            .eq("is_agent", False)
+            .execute()
+        )
+        emails = []
+        for u in (ur.data or []):
+            email = (u.get("email") or "").strip()
+            if email:
+                emails.append(email)
+        # 중복 제거 및 정렬(보기 좋게)
+        return sorted(set(emails))
+
+    try:
+        emails = await _async_retry(_call, name="fetch_email_users_by_proc_inst_id", fallback=lambda: [])
+    except Exception as e:
+        logger.error("fetch_email_users_by_proc_inst_id fatal: %s", str(e), exc_info=e)
+        emails = []
+
+    return ",".join(emails) if emails else ""
+
+async def fetch_tenant_mcp(tenant_id: str) -> Optional[Dict[str, Any]]:
+    """mcp 설정 조회 함수"""
+    if not tenant_id:
+        return None
+
+    def _call():
+        client = get_db_client()
+        return (
+            client.table("tenants")
+            .select("mcp")
+            .eq("id", tenant_id)
+            .single()
+            .execute()
+        )
+
+    try:
+        resp = await _async_retry(_call, name="fetch_tenant_mcp", fallback=lambda: None)
+    except Exception as e:
+        logger.error("fetch_tenant_mcp fatal: %s", str(e), exc_info=e)
+        return None
+
+    return resp.data.get("mcp") if resp and getattr(resp, "data", None) else None

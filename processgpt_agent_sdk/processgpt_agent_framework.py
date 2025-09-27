@@ -17,11 +17,14 @@ from .database import (
     initialize_db,
     polling_pending_todos,
     record_events_bulk,
-    record_event,          # 단건 이벤트 기록
+    record_event,
     save_task_result,
     update_task_error,
     get_consumer_id,
-    fetch_context_bundle,
+    fetch_form_def,
+    fetch_users_grouped,
+    fetch_email_users_by_proc_inst_id,
+    fetch_tenant_mcp,
 )
 from .utils import summarize_error_to_user, summarize_feedback
 
@@ -100,68 +103,108 @@ class ProcessGPTRequestContext(RequestContext):
         self._extra_context: Dict[str, Any] = {}
 
     async def prepare_context(self) -> None:
-        """
-        컨텍스트 준비.
-        - 실패 시: 더 이상 진행하지 않고 ContextPreparationError를 발생시켜
-          상위 경계에서 FAILED 처리(이벤트 기록 포함)를 단일 경로로 수행.
-        """
-        logger.info("\n🔧 컨텍스트 준비 시작...")
-        
-        # 1단계: 기본 정보 추출
+        """익스큐터를 위한 컨텍스트 준비를 합니다."""
+
         effective_proc_inst_id = self.row.get("root_proc_inst_id") or self.row.get("proc_inst_id")
         tool_val = self.row.get("tool") or ""
         tenant_id = self.row.get("tenant_id") or ""
         user_ids = self.row.get("user_id") or ""
-        
-        logger.info("📋 기본 정보 추출 완료 - proc_inst_id: %s, tool: %s, tenant: %s", 
-                   effective_proc_inst_id, tool_val, tenant_id)
 
         try:
-            # 2단계: 컨텍스트 번들 조회
-            logger.info("🔍 컨텍스트 번들 조회 중...")
-            notify_emails, tenant_mcp, form_tuple, agents = await fetch_context_bundle(
-                effective_proc_inst_id, tenant_id, tool_val, user_ids
+            # 데이터베이스 조회
+            user_id_list = [u.strip() for u in (user_ids or '').split(',') if u.strip()]
+            notify_task = fetch_email_users_by_proc_inst_id(effective_proc_inst_id)
+            mcp_task = fetch_tenant_mcp(tenant_id)
+            form_task = fetch_form_def(tool_val, tenant_id)
+            users_task = fetch_users_grouped(user_id_list)
+
+            notify_emails, tenant_mcp, form_tuple, users_group = await asyncio.gather(
+                notify_task, mcp_task, form_task, users_task
             )
             form_id, form_fields, form_html = form_tuple
+            agents, users = users_group
             
-            logger.info("📦 컨텍스트 번들 조회 완료 - agents: %d개, notify_emails: %s, form_type: %s", 
-                       len(agents) if isinstance(agents, list) else 0, 
-                       "있음" if notify_emails else "없음",
-                       "자유형식" if form_id == "freeform" else "정의된 폼")
+            logger.info("\n\n🔍 [데이터베이스 조회 결과]")
+            logger.info("-" * 60)
+            
+            # Users 정보
+            if users:
+                user_info = []
+                for u in users[:5]:
+                    name = u.get("name", u.get("user_name", "Unknown"))
+                    email = u.get("email", "")
+                    user_info.append(f"{name}({email})" if email else name)
+                logger.info("• Users (%d명): %s%s", len(users), ", ".join(user_info), "..." if len(users) > 5 else "")
+            else:
+                logger.info("• Users: 없음")
+            
+            # Agents 정보
+            if agents:
+                agent_info = []
+                for a in agents[:5]:
+                    name = a.get("name", a.get("agent_name", "Unknown"))
+                    tools = a.get("tools", [])
+                    tool_names = [t.get("name", str(t)) for t in tools[:3]] if tools else []
+                    tool_str = f"[{', '.join(tool_names)}]" if tool_names else ""
+                    agent_info.append(f"{name}{tool_str}")
+                logger.info("• Agents (%d개): %s%s", len(agents), ", ".join(agent_info), "..." if len(agents) > 5 else "")
+            else:
+                logger.info("• Agents: 없음")
+            
+            # Form 정보
+            if form_fields:
+                pretty_json = json.dumps(form_fields, ensure_ascii=False, separators=(',', ':'))
+                logger.info("• Form: %s (%d개 필드) - %s", form_id, len(form_fields), pretty_json)
+            else:
+                logger.info("• Form: %s (필드 없음)", form_id)
+            
+            # Notify 정보
+            if notify_emails:
+                email_list = notify_emails.split(',') if ',' in notify_emails else [notify_emails]
+                logger.info("• Notify (%d개): %s", len(email_list), 
+                           ", ".join(email_list[:3]) + ("..." if len(email_list) > 3 else ""))
+            else:
+                logger.info("• Notify: 없음")
+            
+            # MCP 정보 - 상세 표시
+            if tenant_mcp:
+                logger.info("• %s 테넌트에 연결된 MCP 설정 정보가 존재합니다.", tenant_id)
+            else:
+                logger.info("• %s 테넌트에 연결된 MCP 설정 정보가 존재하지 않습니다.", tenant_id)
+            
+            # 피드백 처리
+            feedback_data = self.row.get("feedback")
+            content_data = self.row.get("output") or self.row.get("draft")
+            summarized_feedback = ""
+            if feedback_data:
+                logger.info("\n\n📝 [피드백 처리]")
+                logger.info("-" * 60)
+                logger.info("• %d자 → AI 요약 중...", len(feedback_data))
+                summarized_feedback = await summarize_feedback(feedback_data, content_data)
+                logger.info("• 요약 완료: %d자", len(summarized_feedback))
+            
+            # 컨텍스트 구성
+            self._extra_context = {
+                "id": self.row.get("id"),
+                "proc_inst_id": effective_proc_inst_id,
+                "root_proc_inst_id": self.row.get("root_proc_inst_id"),
+                "activity_name": self.row.get("activity_name"),
+                "agents": agents,
+                "users": users,
+                "tenant_mcp": tenant_mcp,
+                "form_fields": form_fields,
+                "form_html": form_html,
+                "form_id": form_id,
+                "notify_user_emails": notify_emails,
+                "summarized_feedback": summarized_feedback,
+            }
+            
+            logger.info("\n\n🎉 [컨텍스트 준비 완료] 모든 데이터 준비됨")
+            logger.info("-"*60)
             
         except Exception as e:
-            logger.error("❌ 컨텍스트 번들 조회 실패: %s", str(e))
-            # 사용자 친화 요약은 상위 경계에서 한 번만 기록하도록 넘김
+            logger.error("❌ [데이터 조회 실패] %s", str(e))
             raise ContextPreparationError(e)
-
-        # 3단계: 피드백 요약 처리
-        logger.info("📝 피드백 요약 처리 중...")
-        feedback_str = self.row.get("feedback", "")
-        contents_str = self.row.get("output", "") or self.row.get("draft", "")
-        summarized_feedback = ""
-
-        if feedback_str.strip():
-            summarized_feedback = await summarize_feedback(feedback_str, contents_str)
-            logger.info("✅ 피드백 요약 완료 - 원본: %d자 → 요약: %d자", len(feedback_str), len(summarized_feedback))
-
-        # 4단계: 컨텍스트 구성
-        logger.info("🏗️ 컨텍스트 구성 중...")
-        self._extra_context = {
-            "id": self.row.get("id"),
-            "proc_inst_id": effective_proc_inst_id,
-            "root_proc_inst_id": self.row.get("root_proc_inst_id"),
-            "activity_name": self.row.get("activity_name"),
-            "agents": agents,
-            "tenant_mcp": tenant_mcp,
-            "form_fields": form_fields,
-            "form_html": form_html,
-            "form_id": form_id,
-            "notify_user_emails": notify_emails,
-            "summarized_feedback": summarized_feedback,
-        }
-        
-        logger.info("✅ 컨텍스트 준비 완료! (agents=%d개)", 
-                   len(agents) if isinstance(agents, list) else 0)
 
     def get_user_input(self) -> str:
         return self._user_input
@@ -348,11 +391,18 @@ class ProcessGPTAgentServer:
 
         while self.is_running and not self._shutdown_event.is_set():
             try:
-                logger.info("🔍 Polling for tasks (agent_orch=%s)...", self.agent_orch)
+                logger.info("\n\n" + "-"*80)
+                logger.info("🔍 [폴링 시작] 작업 대기 중... (agent_orch=%s)", self.agent_orch)
+                logger.info("-"*80)
+                
                 row = await polling_pending_todos(self.agent_orch, get_consumer_id())
 
                 if row:
-                    logger.info("✅ 새 작업: %s (proc=%s, activity=%s)", row.get("id"), row.get("proc_inst_id"), row.get("activity_name"))
+                    logger.info("\n\n" + "-"*80)
+                    logger.info("✅ [새 작업 발견] Task ID: %s", row.get("id"))
+                    logger.info("• Activity: %s | Tool: %s | Tenant: %s", 
+                               row.get("activity_name"), row.get("tool"), row.get("tenant_id"))
+                    logger.info("-"*80)
                     try:
                         self._current_todo_id = str(row.get("id"))
                         await self.process_todolist_item(row)
@@ -392,29 +442,23 @@ class ProcessGPTAgentServer:
           4) 예외 재전달(상위 루프는 죽지 않고 다음 폴링)
         """
         task_id = row.get("id")
-        logger.info("\n🎯 작업 처리 시작 - Task ID: %s", task_id)
-        logger.info("📝 작업 정보 - proc_inst_id: %s, activity: %s, tool: %s", 
-                   row.get("proc_inst_id"), row.get("activity_name"), row.get("tool"))
+        logger.info("\n🎯 [작업 처리 시작] Task ID: %s", task_id)
         
         friendly_text: Optional[str] = None
 
         try:
             # 1) 컨텍스트 준비 (실패 시 ContextPreparationError로 올라옴)
-            logger.info("🔧 컨텍스트 준비 단계 시작...")
             context = ProcessGPTRequestContext(row)
             await context.prepare_context()
-            logger.info("✅ 컨텍스트 준비 완료")
 
             # 2) 실행
-            logger.info("🤖 에이전트 실행 단계 시작...")
+            logger.info("\n\n🤖 [Agent Orchestrator 실행]")
+            logger.info("-" * 60)
             event_queue = ProcessGPTEventQueue(str(task_id), self.agent_orch, row.get("proc_inst_id"))
             await self.agent_executor.execute(context, event_queue)
-            logger.info("✅ 에이전트 실행 완료")
-
-            # 3) 정상 완료 이벤트
-            logger.info("🏁 작업 완료 처리 중...")
             event_queue.task_done()
-            logger.info("🎉 작업 완료: %s\n", task_id)
+            logger.info("\n🎉 [Agent Orchestrator 완료] Task ID: %s", task_id)
+            logger.info("-"*60)
 
         except Exception as e:
             logger.error("❌ 작업 처리 중 오류 발생: %s", str(e))
