@@ -641,3 +641,5 @@ python my_server.py
 
 ## 버전업
 ./release.sh 버전
+
+오류 발생시 : python -m ensurepip --upgrade

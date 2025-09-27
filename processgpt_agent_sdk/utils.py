@@ -2,64 +2,91 @@ import os
 import logging
 import traceback
 from typing import Any, Dict, Optional, List
-from typing import Iterable, Union
-from openai import AsyncOpenAI
+from llm_factory import create_llm
 
 
 logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────
-# Lazy Singleton OpenAI Client
+# Lazy Singleton LLM Client
 # ─────────────────────────────
-_client: Optional["AsyncOpenAI"] = None  # type: ignore[name-defined]
+_client = None
+_global_agent_model = None
 
-def _require_env(name: str, default: Optional[str] = None) -> str:
-    v = os.getenv(name, default if default is not None else "")
-    if not v:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return v
+def set_agent_model(agent: Optional[Dict[str, Any]]) -> None:
+    """첫 번째 에이전트의 모델을 글로벌 변수에 설정합니다."""
+    global _global_agent_model
+    
+    if agent:
+        model = agent.get("model")
+        if model:
+            # "openai/gpt-4o" 형식을 파싱하여 provider와 model 분리
+            if "/" in model:
+                provider, model_name = model.split("/", 1)
+                _global_agent_model = {"provider": provider, "model": model_name}
+                logger.info("🤖 글로벌 에이전트 모델 설정: %s/%s", provider, model_name)
+            else:
+                # 벤더사명이 없으면 모델명만 저장
+                _global_agent_model = {"provider": None, "model": model}
+                logger.info("🤖 글로벌 에이전트 모델 설정: %s", model)
+        else:
+            _global_agent_model = None
+            logger.info("🤖 에이전트에 모델 정보가 없음")
+    else:
+        _global_agent_model = None
+        logger.info("🤖 에이전트가 없음")
 
-def get_client() -> "AsyncOpenAI":  # type: ignore[name-defined]
+def get_agent_model() -> Optional[str]:
+    """글로벌 에이전트 모델 정보를 반환합니다."""
+    return _global_agent_model
+
+def get_client():
     global _client
     if _client is not None:
         return _client
-    if AsyncOpenAI is None:
-        raise RuntimeError("OpenAI SDK (async) is not available")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    api_key = _require_env("OPENAI_API_KEY", "")
-    _client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    
+    # 글로벌 에이전트 모델로 클라이언트 생성
+    agent_model = get_agent_model()
+    if agent_model:
+        provider = agent_model["provider"]
+        model_name = agent_model["model"]
+        
+        if provider:
+            # 벤더사가 있으면 provider와 model 모두 전달
+            _client = create_llm(provider=provider, model=model_name, temperature=0)
+            logger.info("🤖 글로벌 에이전트 모델로 LLM 클라이언트 초기화: %s/%s", provider, model_name)
+        else:
+            # 벤더사가 없으면 model만 전달
+            _client = create_llm(model=model_name, temperature=0)
+            logger.info("🤖 글로벌 에이전트 모델로 LLM 클라이언트 초기화: %s", model_name)
+    else:
+        _client = create_llm(model="gpt-4.1-mini", temperature=0)
+        logger.info("🔧 기본 모델로 LLM 클라이언트 초기화: gpt-4.1-mini")
     return _client
 
 # ─────────────────────────────
 # 공통 LLM 호출 유틸
 # ─────────────────────────────
-async def _llm_request(system: str, user: str, model_env: str, default_model: str) -> str:
-    model_name = os.getenv(model_env, default_model)
-    logger.info("📡 LLM 요청 전송 (모델: %s)", model_name)
+async def _llm_request(system: str, user: str) -> str:
+    logger.info("📡 LLM 요청 전송")
 
-    client = get_client()
-    # responses API (신규)
-    resp = await client.responses.create(
-        model=model_name,
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-
-    # 다양한 SDK 출력 구조 호환
-    text: Optional[str] = None
-    try:
-        text = getattr(resp, "output_text", None)  # 최신 필드
-    except Exception:
-        text = None
-
-    if not text and hasattr(resp, "choices") and resp.choices:  # 구 구조 호환
-        choice0 = resp.choices[0]
-        text = getattr(getattr(choice0, "message", None), "content", None)
-
-    if not text:
+    model = get_client()
+    
+    # llm_factory를 사용한 LLM 호출
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    
+    response = await model.ainvoke(messages)
+    
+    # 응답에서 텍스트 추출
+    if hasattr(response, 'content'):
+        text = response.content
+    elif isinstance(response, str):
+        text = response
+    else:
         raise RuntimeError("No text in LLM response")
 
     return text.strip()
@@ -68,12 +95,8 @@ async def _llm_request(system: str, user: str, model_env: str, default_model: st
 # 공개 API
 # ─────────────────────────────
 async def summarize_error_to_user(exc: Exception, meta: Dict[str, Any]) -> str:
-    """
-    예외 정보를 바탕으로 사용자 친화적인 5줄 요약을 생성.
-    - 모델: gpt-4.1-nano (환경변수 ERROR_SUMMARY_MODEL로 재정의 가능)
-    - 폴백: 없음 (LLM 실패 시 예외를 상위로 전파)
-    """
-    logger.info("🔍 오류 컨텍스트 분석 시작")
+    """예외 정보를 바탕으로 사용자 친화적인 5줄 요약을 생성."""
+    logger.info("\n\n🔍 오류 컨텍스트 분석 시작")
 
     err_text = f"{type(exc).__name__}: {str(exc)}"
 
@@ -109,20 +132,15 @@ async def summarize_error_to_user(exc: Exception, meta: Dict[str, Any]) -> str:
     )
 
     try:
-        text = await _llm_request(system, user, "ERROR_SUMMARY_MODEL", "gpt-4.1-nano")
+        text = await _llm_request(system, user)
         logger.info("✅ LLM 오류 요약 생성 완료")
         return text
     except Exception as e:
         logger.warning("⚠️ LLM 오류 요약 생성 실패: %s", e, exc_info=True)
-        # 폴백 없이 상위 전파
         raise
 
 async def summarize_feedback(feedback_data: List[dict], content_data: dict = {}) -> str:
-    """
-    피드백과 결과물을 바탕으로 통합된 피드백 요약을 생성.
-    - 모델: gpt-4.1-nano (환경변수 FEEDBACK_SUMMARY_MODEL로 재정의 가능)
-    - 폴백: 없음 (LLM 실패 시 예외를 상위로 전파)
-    """
+    """피드백과 결과물을 바탕으로 통합된 피드백 요약을 생성."""
     logger.info(
         "🔍 피드백 요약 처리 시작 | 피드백: %s, 결과물: %s자",
         feedback_data, content_data)
@@ -131,12 +149,11 @@ async def summarize_feedback(feedback_data: List[dict], content_data: dict = {})
     user_prompt = _create_feedback_summary_prompt(feedback_data, content_data)
 
     try:
-        text = await _llm_request(system_prompt, user_prompt, "FEEDBACK_SUMMARY_MODEL", "gpt-4.1-nano")
+        text = await _llm_request(system_prompt, user_prompt)
         logger.info("✅ LLM 피드백 요약 생성 완료")
         return text
     except Exception as e:
         logger.error("❌ LLM 피드백 요약 생성 실패: %s", e, exc_info=True)
-        # 폴백 없이 상위 전파
         raise
 
 # ─────────────────────────────
@@ -166,6 +183,7 @@ def _create_feedback_summary_prompt(feedback_data: List[dict], content_data: dic
 - 구체적이고 실행 가능한 개선사항 제시
 - **자연스럽고 통합된 하나의 완전한 피드백으로 작성**
 - 최대 1000자까지 허용하여 상세히 작성
+- 만약 전달된 피드백 내용이 1000자 미만일 경우 요약하지 않고 하나의 문맥으로 그대로 반환
 
 **중요한 상황별 처리:**
 - 결과물 품질에 대한 불만 → **품질 개선** 요구

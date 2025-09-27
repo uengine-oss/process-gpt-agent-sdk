@@ -26,7 +26,7 @@ from .database import (
     fetch_email_users_by_proc_inst_id,
     fetch_tenant_mcp,
 )
-from .utils import summarize_error_to_user, summarize_feedback
+from .utils import summarize_error_to_user, summarize_feedback, set_agent_model
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -123,6 +123,9 @@ class ProcessGPTRequestContext(RequestContext):
             )
             form_id, form_fields, form_html = form_tuple
             agents, users = users_group
+            
+            # 글로벌 에이전트 모델 설정
+            set_agent_model(agents[0] if agents else None)
             
             logger.info("\n\n🔍 [데이터베이스 조회 결과]")
             

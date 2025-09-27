@@ -1,8 +1,8 @@
 # Core
 supabase>=2.0.0
-openai>=1.30.0
 python-dotenv>=1.0.0
 a2a-sdk==0.3.0
-
-# Python <3.11 환경 호환(선택)
 typing-extensions>=4.0.0
+process-gpt-llm-factory==1.0.2
+pydantic>=2.0.0
+requests>=2.25.0
