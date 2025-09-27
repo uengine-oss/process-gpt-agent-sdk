@@ -125,7 +125,6 @@ class ProcessGPTRequestContext(RequestContext):
             agents, users = users_group
             
             logger.info("\n\n🔍 [데이터베이스 조회 결과]")
-            logger.info("-" * 60)
             
             # Users 정보
             if users:
@@ -141,11 +140,10 @@ class ProcessGPTRequestContext(RequestContext):
             # Agents 정보
             if agents:
                 agent_info = []
-                for a in agents[:5]:
+                for a in agents:
                     name = a.get("name", a.get("agent_name", "Unknown"))
-                    tools = a.get("tools", [])
-                    tool_names = [t.get("name", str(t)) for t in tools[:3]] if tools else []
-                    tool_str = f"[{', '.join(tool_names)}]" if tool_names else ""
+                    tools = a.get("tools", "")
+                    tool_str = f"[{tools}]" if tools else ""
                     agent_info.append(f"{name}{tool_str}")
                 logger.info("• Agents (%d개): %s%s", len(agents), ", ".join(agent_info), "..." if len(agents) > 5 else "")
             else:
@@ -178,7 +176,6 @@ class ProcessGPTRequestContext(RequestContext):
             summarized_feedback = ""
             if feedback_data:
                 logger.info("\n\n📝 [피드백 처리]")
-                logger.info("-" * 60)
                 logger.info("• %d자 → AI 요약 중...", len(feedback_data))
                 summarized_feedback = await summarize_feedback(feedback_data, content_data)
                 logger.info("• 요약 완료: %d자", len(summarized_feedback))
@@ -200,7 +197,6 @@ class ProcessGPTRequestContext(RequestContext):
             }
             
             logger.info("\n\n🎉 [컨텍스트 준비 완료] 모든 데이터 준비됨")
-            logger.info("-"*60)
             
         except Exception as e:
             logger.error("❌ [데이터 조회 실패] %s", str(e))
@@ -240,7 +236,7 @@ class ProcessGPTEventQueue(EventQueue):
         try:
             proc_inst_id_val = getattr(event, "contextId", None) or self.proc_inst_id
             todo_id_val = getattr(event, "taskId", None) or str(self.todolist_id)
-            logger.info("\n📨 이벤트 수신: %s (task=%s)", type(event).__name__, self.todolist_id)
+            logger.info("\n\n📨 이벤트 수신: %s (task=%s)", type(event).__name__, self.todolist_id)
 
             # 1) 결과물 저장
             if isinstance(event, TaskArtifactUpdateEvent):
@@ -391,18 +387,14 @@ class ProcessGPTAgentServer:
 
         while self.is_running and not self._shutdown_event.is_set():
             try:
-                logger.info("\n\n" + "-"*80)
                 logger.info("🔍 [폴링 시작] 작업 대기 중... (agent_orch=%s)", self.agent_orch)
-                logger.info("-"*80)
                 
                 row = await polling_pending_todos(self.agent_orch, get_consumer_id())
 
                 if row:
-                    logger.info("\n\n" + "-"*80)
                     logger.info("✅ [새 작업 발견] Task ID: %s", row.get("id"))
                     logger.info("• Activity: %s | Tool: %s | Tenant: %s", 
                                row.get("activity_name"), row.get("tool"), row.get("tenant_id"))
-                    logger.info("-"*80)
                     try:
                         self._current_todo_id = str(row.get("id"))
                         await self.process_todolist_item(row)
@@ -453,12 +445,10 @@ class ProcessGPTAgentServer:
 
             # 2) 실행
             logger.info("\n\n🤖 [Agent Orchestrator 실행]")
-            logger.info("-" * 60)
             event_queue = ProcessGPTEventQueue(str(task_id), self.agent_orch, row.get("proc_inst_id"))
             await self.agent_executor.execute(context, event_queue)
             event_queue.task_done()
-            logger.info("\n🎉 [Agent Orchestrator 완료] Task ID: %s", task_id)
-            logger.info("-"*60)
+            logger.info("\n\n🎉 [Agent Orchestrator 완료] Task ID: %s", task_id)
 
         except Exception as e:
             logger.error("❌ 작업 처리 중 오류 발생: %s", str(e))
