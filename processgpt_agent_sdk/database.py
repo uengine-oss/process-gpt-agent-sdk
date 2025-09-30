@@ -82,7 +82,7 @@ def initialize_db() -> None:
             load_dotenv()
 
         supabase_url = os.getenv("SUPABASE_URL") or os.getenv("SUPABASE_KEY_URL")
-        supabase_key = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+        supabase_key = os.getenv("SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
         logger.info(
             "[SUPABASE 연결정보]\n  URL: %s\n  KEY: %s\n",
             supabase_url,
