@@ -80,8 +80,14 @@ def initialize_db() -> None:
     try:
         if os.getenv("ENV") != "production":
             load_dotenv()
+
         supabase_url = os.getenv("SUPABASE_URL") or os.getenv("SUPABASE_KEY_URL")
         supabase_key = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+        logger.info(
+            "[SUPABASE 연결정보]\n  URL: %s\n  KEY: %s\n",
+            supabase_url,
+            supabase_key
+        )
         if not supabase_url or not supabase_key:
             raise RuntimeError("SUPABASE_URL 및 SUPABASE_KEY가 필요합니다")
         _supabase_client = create_client(supabase_url, supabase_key)
@@ -119,6 +125,8 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
         if p_env != "dev":
             p_env = "prod"
 
+        logger.info("\n🔍 [폴링 시작] 작업 대기 중...")
+        logger.info("agent_orch=%s, consumer_id=%s, p_env=%s, p_limit=%d", agent_orch, get_consumer_id(), p_env, 1)
         resp = client.rpc(
             "fetch_pending_task",
             {
@@ -131,6 +139,7 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
 
         rows = resp.data or []
         if not rows:
+            logger.info("\n❌ [폴링 결과 없음] 작업 대기 중...")
             return None
         
         row = rows[0]

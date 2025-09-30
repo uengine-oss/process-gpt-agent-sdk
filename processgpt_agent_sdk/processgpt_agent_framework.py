@@ -352,7 +352,7 @@ class ProcessGPTEventQueue(EventQueue):
                 "job_id": "CREW_FINISHED",
                 "todo_id": str(self.todolist_id),
                 "proc_inst_id": self.proc_inst_id,
-                "crew_type": "agent",
+                "crew_type": "crew",
                 "data": "Task completed successfully",
                 "event_type": "crew_completed",
                 "status": None,
@@ -390,8 +390,6 @@ class ProcessGPTAgentServer:
 
         while self.is_running and not self._shutdown_event.is_set():
             try:
-                logger.info("🔍 [폴링 시작] 작업 대기 중... (agent_orch=%s)", self.agent_orch)
-                
                 row = await polling_pending_todos(self.agent_orch, get_consumer_id())
 
                 if row:
