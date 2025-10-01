@@ -133,7 +133,7 @@ class ProcessGPTRequestContext(RequestContext):
             if users:
                 user_info = []
                 for u in users[:5]:
-                    name = u.get("name", u.get("user_name", "Unknown"))
+                    name = u.get("name", u.get("username", "Unknown"))
                     email = u.get("email", "")
                     user_info.append(f"{name}({email})" if email else name)
                 logger.info("• Users (%d명): %s%s", len(users), ", ".join(user_info), "..." if len(users) > 5 else "")
@@ -144,7 +144,7 @@ class ProcessGPTRequestContext(RequestContext):
             if agents:
                 agent_info = []
                 for a in agents:
-                    name = a.get("name", a.get("agent_name", "Unknown"))
+                    name = a.get("name", a.get("username", "Unknown"))
                     tools = a.get("tools", "")
                     tool_str = f"[{tools}]" if tools else ""
                     agent_info.append(f"{name}{tool_str}")
