@@ -156,6 +156,43 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
     return await _async_retry(_call, name="polling_pending_todos", fallback=lambda: None)
 
 
+# ------------------------------ Fetch Single Todo ------------------------------
+async def fetch_todo_by_id(todo_id: str) -> Optional[Dict[str, Any]]:
+    """todo_id로 단건 조회 후 컨텍스트 준비에 필요한 형태로 정규화합니다.
+
+    - 어떤 필드도 업데이트하지 않고, 조건 없이 id로만 조회합니다.
+    """
+    if not todo_id:
+        return None
+
+    def _call():
+        client = get_db_client()
+        resp = (
+            client.table("todolist")
+            .select("*")
+            .eq("id", todo_id)
+            .single()
+            .execute()
+        )
+        row = getattr(resp, "data", None)
+        if not row:
+            return None
+        return row
+
+    row = await _async_retry(_call, name="fetch_todo_by_id", fallback=lambda: None)
+    if not row:
+        return None
+
+    # 빈 컨테이너 정규화
+    if row.get("feedback") in ([], {}):
+        row["feedback"] = None
+    if row.get("output") in ([], {}):
+        row["output"] = None
+    if row.get("draft") in ([], {}):
+        row["draft"] = None
+
+    return row
+
 # ------------------------------ Events & Results ------------------------------
 async def record_events_bulk(payloads: List[Dict[str, Any]]) -> None:
     """이벤트 다건 저장 함수"""
