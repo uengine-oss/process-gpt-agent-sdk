@@ -141,6 +141,19 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
             row["output"] = None
         if row.get("draft") in ([], {}):
             row["draft"] = None
+
+        if agent_orch == "browser-automation-agent":
+            resp = (
+                client.table("env").select("value").eq("key", "browser_use").eq("tenant_id", row["tenant_id"] or "").execute()
+            )
+            data = (resp.data or [])
+            logger.info("browser_use_sensitive_data: %s", data)
+            if not data:
+                row["sensitive_data"] = "{}"
+            else:
+                row["sensitive_data"] = data[0].get("value") if data and getattr(data, "data", None) else None
+
+            logger.info("browser_use_sensitive_data: %s", row["sensitive_data"])
             
         return row
 

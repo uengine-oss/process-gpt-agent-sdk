@@ -182,6 +182,8 @@ class ProcessGPTRequestContext(RequestContext):
                 logger.info("• %d자 → AI 요약 중...", len(feedback_data))
                 summarized_feedback = await summarize_feedback(feedback_data, content_data)
                 logger.info("• 요약 완료: %d자", len(summarized_feedback))
+
+            logger.info("sensitive_data: %s", self.row.get("sensitive_data") or "{}")
             
             # 컨텍스트 구성
             self._extra_context = {
@@ -197,6 +199,7 @@ class ProcessGPTRequestContext(RequestContext):
                 "form_id": form_id,
                 "notify_user_emails": notify_emails,
                 "summarized_feedback": summarized_feedback,
+                "sensitive_data": self.row.get("sensitive_data") or "{}",
             }
             
             logger.info("\n\n🎉 [컨텍스트 준비 완료] 모든 데이터 준비됨")
