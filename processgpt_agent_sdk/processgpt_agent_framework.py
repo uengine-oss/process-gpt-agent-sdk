@@ -133,7 +133,7 @@ class ProcessGPTRequestContext(RequestContext):
             if users:
                 user_info = []
                 for u in users[:5]:
-                    name = u.get("name", u.get("user_name", "Unknown"))
+                    name = u.get("name", u.get("username", "Unknown"))
                     email = u.get("email", "")
                     user_info.append(f"{name}({email})" if email else name)
                 logger.info("• Users (%d명): %s%s", len(users), ", ".join(user_info), "..." if len(users) > 5 else "")
@@ -144,7 +144,7 @@ class ProcessGPTRequestContext(RequestContext):
             if agents:
                 agent_info = []
                 for a in agents:
-                    name = a.get("name", a.get("agent_name", "Unknown"))
+                    name = a.get("name", a.get("username", "Unknown"))
                     tools = a.get("tools", "")
                     tool_str = f"[{tools}]" if tools else ""
                     agent_info.append(f"{name}{tool_str}")
@@ -247,19 +247,16 @@ class ProcessGPTEventQueue(EventQueue):
             # 1) 결과물 저장
             if isinstance(event, TaskArtifactUpdateEvent):
                 logger.info("📄 아티팩트 업데이트 이벤트 처리 중...")
-                try:
-                    is_final = bool(
-                        getattr(event, "final", None)
-                        or getattr(event, "lastChunk", None)
-                        or getattr(event, "last_chunk", None)
-                        or getattr(event, "last", None)
-                    )
-                    artifact_content = self._extract_payload(event)
-                    logger.info("💾 아티팩트 저장 중... (final=%s)", is_final)
-                    asyncio.create_task(save_task_result(self.todolist_id, artifact_content, is_final))
-                    logger.info("✅ 아티팩트 저장 완료")
-                except Exception as e:
-                    logger.exception("❌ 아티팩트 저장 실패: %s", str(e))
+                is_final = bool(
+                    getattr(event, "final", None)
+                    or getattr(event, "lastChunk", None)
+                    or getattr(event, "last_chunk", None)
+                    or getattr(event, "last", None)
+                )
+                artifact_content = self._extract_payload(event)
+                logger.info("💾 아티팩트 저장 중... (final=%s)", is_final)
+                asyncio.create_task(save_task_result(self.todolist_id, artifact_content, is_final))
+                logger.info("✅ 아티팩트 저장 완료")
                 return
 
             # 2) 상태 이벤트 저장(코얼레싱 → bulk)
@@ -275,22 +272,19 @@ class ProcessGPTEventQueue(EventQueue):
                 
                 logger.info("🔍 이벤트 메타데이터 분석 - event_type: %s, status: %s", event_type_val, status_val)
                 
-                try:
-                    payload: Dict[str, Any] = {
-                        "id": str(uuid.uuid4()),
-                        "job_id": job_id_val,
-                        "todo_id": str(todo_id_val),
-                        "proc_inst_id": proc_inst_id_val,
-                        "crew_type": crew_type_val,
-                        "event_type": event_type_val,
-                        "data": self._extract_payload(event),
-                        "status": status_val or None,
-                    }
-                    logger.info("📤 상태 이벤트 큐에 추가 중...")
-                    asyncio.create_task(enqueue_ui_event_coalesced(payload))
-                    logger.info("✅ 상태 이벤트 큐 추가 완료")
-                except Exception as e:
-                    logger.exception("❌ 상태 이벤트 기록 실패: %s", str(e))
+                payload: Dict[str, Any] = {
+                    "id": str(uuid.uuid4()),
+                    "job_id": job_id_val,
+                    "todo_id": str(todo_id_val),
+                    "proc_inst_id": proc_inst_id_val,
+                    "crew_type": crew_type_val,
+                    "event_type": event_type_val,
+                    "data": self._extract_payload(event),
+                    "status": status_val or None,
+                }
+                logger.info("📤 상태 이벤트 큐에 추가 중...")
+                asyncio.create_task(enqueue_ui_event_coalesced(payload))
+                logger.info("✅ 상태 이벤트 큐 추가 완료")
                 return
 
         except Exception as e:
@@ -298,54 +292,39 @@ class ProcessGPTEventQueue(EventQueue):
             raise
 
     def _extract_payload(self, event: Event) -> Any:
-        try:
-            artifact_or_none = getattr(event, "artifact", None)
-            status_or_none = getattr(event, "status", None)
-            message_or_none = getattr(status_or_none, "message", None)
-            source = artifact_or_none if artifact_or_none is not None else message_or_none
-            return self._parse_json_or_text(source)
-        except Exception:
-            return {}
+        artifact_or_none = getattr(event, "artifact", None)
+        status_or_none = getattr(event, "status", None)
+        message_or_none = getattr(status_or_none, "message", None)
+        source = artifact_or_none if artifact_or_none is not None else message_or_none
+        return self._parse_json_or_text(source)
 
     def _parse_json_or_text(self, value: Any) -> Any:
-        try:
-            if value is None:
-                return {}
-            if isinstance(value, str):
-                text = value.strip()
-                if not text:
-                    return ""
-                try:
-                    return json.loads(text)
-                except Exception:
-                    return text
-            if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
-                value = value.model_dump()
-            elif not isinstance(value, dict) and hasattr(value, "dict") and callable(getattr(value, "dict")):
-                value = value.dict()
-            elif not isinstance(value, dict) and hasattr(value, "__dict__"):
-                value = value.__dict__
-            if isinstance(value, dict):
-                parts = value.get("parts")
-                if isinstance(parts, list) and parts:
-                    first = parts[0] if isinstance(parts[0], dict) else None
-                    if first and isinstance(first, dict):
-                        txt = first.get("text") or first.get("content") or first.get("data")
-                        if isinstance(txt, str):
-                            try:
-                                return json.loads(txt)
-                            except Exception:
-                                return txt
-                top_text = value.get("text") or value.get("content") or value.get("data")
-                if isinstance(top_text, str):
-                    try:
-                        return json.loads(top_text)
-                    except Exception:
-                        return top_text
-                return value
-            return value
-        except Exception:
+        if value is None:
             return {}
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return ""
+            return json.loads(text)
+        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+            value = value.model_dump()
+        elif not isinstance(value, dict) and hasattr(value, "dict") and callable(getattr(value, "dict")):
+            value = value.dict()
+        elif not isinstance(value, dict) and hasattr(value, "__dict__"):
+            value = value.__dict__
+        if isinstance(value, dict):
+            parts = value.get("parts")
+            if isinstance(parts, list) and parts:
+                first = parts[0] if isinstance(parts[0], dict) else None
+                if first and isinstance(first, dict):
+                    txt = first.get("text") or first.get("content") or first.get("data")
+                    if isinstance(txt, str):
+                        return json.loads(txt)
+            top_text = value.get("text") or value.get("content") or value.get("data")
+            if isinstance(top_text, str):
+                return json.loads(top_text)
+            return value
+        return value
 
     def task_done(self) -> None:
         try:
@@ -355,7 +334,7 @@ class ProcessGPTEventQueue(EventQueue):
                 "job_id": "CREW_FINISHED",
                 "todo_id": str(self.todolist_id),
                 "proc_inst_id": self.proc_inst_id,
-                "crew_type": "agent",
+                "crew_type": "crew",
                 "data": "Task completed successfully",
                 "event_type": "crew_completed",
                 "status": None,
@@ -393,8 +372,6 @@ class ProcessGPTAgentServer:
 
         while self.is_running and not self._shutdown_event.is_set():
             try:
-                logger.info("🔍 [폴링 시작] 작업 대기 중... (agent_orch=%s)", self.agent_orch)
-                
                 row = await polling_pending_todos(self.agent_orch, get_consumer_id())
 
                 if row:
@@ -513,7 +490,6 @@ class ProcessGPTAgentServer:
 
             # 상위로 재전달하여 루프는 계속(죽지 않음)
             logger.error("🔄 오류 처리 완료 - 다음 작업으로 계속 진행")
-            raise
 
     def stop(self):
         self.is_running = False

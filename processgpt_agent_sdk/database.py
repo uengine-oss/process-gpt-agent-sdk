@@ -80,8 +80,14 @@ def initialize_db() -> None:
     try:
         if os.getenv("ENV") != "production":
             load_dotenv()
+
         supabase_url = os.getenv("SUPABASE_URL") or os.getenv("SUPABASE_KEY_URL")
-        supabase_key = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+        supabase_key = os.getenv("SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+        logger.info(
+            "[SUPABASE 연결정보]\n  URL: %s\n  KEY: %s\n",
+            supabase_url,
+            supabase_key
+        )
         if not supabase_url or not supabase_key:
             raise RuntimeError("SUPABASE_URL 및 SUPABASE_KEY가 필요합니다")
         _supabase_client = create_client(supabase_url, supabase_key)
@@ -119,6 +125,8 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
         if p_env != "dev":
             p_env = "prod"
 
+        logger.info("\n🔍 [폴링 시작] 작업 대기 중...")
+        logger.info("agent_orch=%s, consumer_id=%s, p_env=%s, p_limit=%d", agent_orch, get_consumer_id(), p_env, 1)
         resp = client.rpc(
             "fetch_pending_task",
             {
@@ -131,6 +139,7 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
 
         rows = resp.data or []
         if not rows:
+            logger.info("\n❌ [폴링 결과 없음] 작업 대기 중...")
             return None
         
         row = rows[0]
@@ -159,6 +168,43 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
 
     return await _async_retry(_call, name="polling_pending_todos", fallback=lambda: None)
 
+
+# ------------------------------ Fetch Single Todo ------------------------------
+async def fetch_todo_by_id(todo_id: str) -> Optional[Dict[str, Any]]:
+    """todo_id로 단건 조회 후 컨텍스트 준비에 필요한 형태로 정규화합니다.
+
+    - 어떤 필드도 업데이트하지 않고, 조건 없이 id로만 조회합니다.
+    """
+    if not todo_id:
+        return None
+
+    def _call():
+        client = get_db_client()
+        resp = (
+            client.table("todolist")
+            .select("*")
+            .eq("id", todo_id)
+            .single()
+            .execute()
+        )
+        row = getattr(resp, "data", None)
+        if not row:
+            return None
+        return row
+
+    row = await _async_retry(_call, name="fetch_todo_by_id", fallback=lambda: None)
+    if not row:
+        return None
+
+    # 빈 컨테이너 정규화
+    if row.get("feedback") in ([], {}):
+        row["feedback"] = None
+    if row.get("output") in ([], {}):
+        row["output"] = None
+    if row.get("draft") in ([], {}):
+        row["draft"] = None
+
+    return row
 
 # ------------------------------ Events & Results ------------------------------
 async def record_events_bulk(payloads: List[Dict[str, Any]]) -> None:
