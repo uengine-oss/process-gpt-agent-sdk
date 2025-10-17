@@ -160,7 +160,7 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
             if not data:
                 row["sensitive_data"] = "{}"
             else:
-                row["sensitive_data"] = data[0].get("value") if data and getattr(data, "data", None) else None
+                row["sensitive_data"] = data[0].get("value") if data else None
 
             logger.info("browser_use_sensitive_data: %s", row["sensitive_data"])
             

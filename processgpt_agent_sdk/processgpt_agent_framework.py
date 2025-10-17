@@ -135,7 +135,11 @@ class ProcessGPTRequestContext(RequestContext):
                 for u in users[:5]:
                     name = u.get("name", u.get("username", "Unknown"))
                     email = u.get("email", "")
-                    user_info.append(f"{name}({email})" if email else name)
+                    user_str = f"{name}({email})" if email else name
+                    # None 값 제거
+                    if user_str and user_str != "None":
+                        user_info.append(user_str)
+                logger.info("🔧 [Users 정보] user_info 리스트: %s", user_info)
                 logger.info("• Users (%d명): %s%s", len(users), ", ".join(user_info), "..." if len(users) > 5 else "")
             else:
                 logger.info("• Users: 없음")
@@ -147,7 +151,11 @@ class ProcessGPTRequestContext(RequestContext):
                     name = a.get("name", a.get("username", "Unknown"))
                     tools = a.get("tools", "")
                     tool_str = f"[{tools}]" if tools else ""
-                    agent_info.append(f"{name}{tool_str}")
+                    agent_str = f"{name}{tool_str}"
+                    # None 값 제거
+                    if agent_str and agent_str != "None":
+                        agent_info.append(agent_str)
+                logger.info("🔧 [Agents 정보] agent_info 리스트: %s", agent_info)
                 logger.info("• Agents (%d개): %s%s", len(agents), ", ".join(agent_info), "..." if len(agents) > 5 else "")
             else:
                 logger.info("• Agents: 없음")
@@ -182,6 +190,9 @@ class ProcessGPTRequestContext(RequestContext):
                 logger.info("• %d자 → AI 요약 중...", len(feedback_data))
                 summarized_feedback = await summarize_feedback(feedback_data, content_data)
                 logger.info("• 요약 완료: %d자", len(summarized_feedback))
+            else:
+                logger.info("• 피드백 없음")
+            logger.info("✅ [피드백 처리 완료]")
 
             logger.info("sensitive_data: %s", self.row.get("sensitive_data") or "{}")
             
@@ -292,11 +303,15 @@ class ProcessGPTEventQueue(EventQueue):
             raise
 
     def _extract_payload(self, event: Event) -> Any:
-        artifact_or_none = getattr(event, "artifact", None)
-        status_or_none = getattr(event, "status", None)
-        message_or_none = getattr(status_or_none, "message", None)
-        source = artifact_or_none if artifact_or_none is not None else message_or_none
-        return self._parse_json_or_text(source)
+        try:
+            artifact_or_none = getattr(event, "artifact", None)
+            status_or_none = getattr(event, "status", None)
+            message_or_none = getattr(status_or_none, "message", None)
+            source = artifact_or_none if artifact_or_none is not None else message_or_none
+            return self._parse_json_or_text(source)
+        except Exception as e:
+            logger.error("❌ [이벤트 페이로드 추출 실패] %s", str(e), exc_info=e)
+            return {}
 
     def _parse_json_or_text(self, value: Any) -> Any:
         if value is None:
@@ -305,7 +320,17 @@ class ProcessGPTEventQueue(EventQueue):
             text = value.strip()
             if not text:
                 return ""
-            return json.loads(text)
+            # JSON인지 먼저 확인 (중괄호나 대괄호로 시작하는지)
+            if text.startswith(('{', '[')):
+                try:
+                    result = json.loads(text)
+                    return result
+                except json.JSONDecodeError as e:
+                    logger.debug("🔧 [JSON 파싱] JSON 파싱 실패 - 텍스트로 처리: %s", str(e))
+                    return text
+            else:
+                logger.debug("🔧 [JSON 파싱] 문자열은 JSON 형태가 아님 - 텍스트로 처리")
+                return text
         if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
             value = value.model_dump()
         elif not isinstance(value, dict) and hasattr(value, "dict") and callable(getattr(value, "dict")):
@@ -319,10 +344,32 @@ class ProcessGPTEventQueue(EventQueue):
                 if first and isinstance(first, dict):
                     txt = first.get("text") or first.get("content") or first.get("data")
                     if isinstance(txt, str):
-                        return json.loads(txt)
+                        # JSON인지 먼저 확인 (중괄호나 대괄호로 시작하는지)
+                        txt_stripped = txt.strip()
+                        if txt_stripped.startswith(('{', '[')):
+                            try:
+                                result = json.loads(txt)
+                                return result
+                            except Exception as e:
+                                logger.debug("🔧 [JSON 파싱] parts 텍스트 JSON 파싱 실패 - 텍스트로 처리: %s", str(e))
+                                return txt
+                        else:
+                            logger.debug("🔧 [JSON 파싱] parts 텍스트는 JSON 형태가 아님 - 텍스트로 처리")
+                            return txt
             top_text = value.get("text") or value.get("content") or value.get("data")
             if isinstance(top_text, str):
-                return json.loads(top_text)
+                # JSON인지 먼저 확인 (중괄호나 대괄호로 시작하는지)
+                top_text_stripped = top_text.strip()
+                if top_text_stripped.startswith(('{', '[')):
+                    try:
+                        result = json.loads(top_text)
+                        return result
+                    except Exception as e:
+                        logger.debug("🔧 [JSON 파싱] 최상위 텍스트 JSON 파싱 실패 - 텍스트로 처리: %s", str(e))
+                        return top_text
+                else:
+                    logger.debug("🔧 [JSON 파싱] 최상위 텍스트는 JSON 형태가 아님 - 텍스트로 처리")
+                    return top_text
             return value
         return value
 
