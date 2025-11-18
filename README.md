@@ -1,16 +1,14 @@
-배포: ./release.sh 0.2.8 (버전은 pyproject.toml에서 확인 후 진행) 조금이라도 수정을 했다면, 버전은 계속 올려가면서 진행해야합니다.
+
 
 # ProcessGPT Agent Framework
 
-Google A2A SDK의 인터페이스를 활용하면서 웹소켓 대신 Supabase 실시간 DB를 사용하는 에이전트 실행 프레임워크입니다.
+Google A2A SDK의 인터페이스를 활용하면서 ProcessGPT의 Todolist (Supabase)에 쌓인 요청을 처리하도록 하는 에이전트 실행 프레임워크입니다.
 
 ## 🏗️ 아키텍처 개요
 
-이 프레임워크는 기존의 Google A2A SDK의 `AgentExecutor`와 `RequestContext` 인터페이스를 그대로 활용하되, 웹소켓 기반 통신 대신 Supabase 데이터베이스를 중간 매개체로 사용합니다.
-
 ### 핵심 구성 요소
 
-1. **Supabase Database Tables**
+1. **Process GPT Todo Tables**
    - `todolist`: 에이전트가 처리해야 할 작업들을 저장
    - `events`: 각 태스크의 실행 상태와 진행 과정을 추적
 
@@ -64,6 +62,15 @@ class MyBusinessAgentExecutor(AgentExecutor):
             }
         )
         event_queue.enqueue_event(start_event)
+
+        # 2.5 TODO 메타데이터 접근
+        todo_record = context_data.get("row", {})
+        extras = context_data.get("extras", {})
+        proc_inst_id = todo_record.get("root_proc_inst_id") or row.get("proc_inst_id")
+        task_id = todo_record.get("id")
+        tenant_id = todo_record.get("tenant_id")
+        form_id = extras.get("form_id")   # 결과 Form ID
+        form_fields = extras.get("form_fields")   # 결과 Form Scheme
         
         try:
             # 3. 작업 단계별 처리
@@ -342,174 +349,13 @@ ORDER BY created_at DESC
 LIMIT 5;
 ```
 
-#### 4.2 Python 클라이언트로 테스트
 
-```python
-import os
-from supabase import create_client, Client
-
-# Supabase 클라이언트 초기화
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_ANON_KEY")
-)
-
-def create_test_task(description: str, agent_type: str = "my_business_agent"):
-    """테스트 작업 생성"""
-    
-    task_data = {
-        "user_id": "test-user-001",
-        "proc_inst_id": f"proc-inst-{os.urandom(8).hex()}",
-        "activity_name": "test_task",
-        "description": description,
-        "tenant_id": "test-tenant-001",
-        "agent_orch": agent_type,
-        "status": "IN_PROGRESS"
-    }
-    
-    try:
-        result = supabase.table("todolist").insert(task_data).execute()
-        task_id = result.data[0]["id"]
-        print(f"✅ 작업 생성 성공: {task_id}")
-        print(f"📝 설명: {description}")
-        return task_id
-    except Exception as e:
-        print(f"❌ 작업 생성 실패: {e}")
-        return None
-
-def monitor_task_progress(task_id: str):
-    """작업 진행상황 모니터링"""
-    
-    print(f"\n📊 작업 진행상황 모니터링: {task_id}")
-    
-    try:
-        # 작업 상태 조회
-        task_result = supabase.table("todolist").select("*").eq("id", task_id).execute()
-        if task_result.data:
-            task = task_result.data[0]
-            print(f"상태: {task['status']}")
-            print(f"Draft 상태: {task.get('draft_status', 'None')}")
-            
-        # 관련 이벤트 조회
-        events_result = supabase.table("events").select("*").eq("todolist_id", task_id).order("created_at").execute()
-        
-        print(f"\n📋 이벤트 히스토리 ({len(events_result.data)}개):")
-        for event in events_result.data:
-            print(f"  [{event['created_at']}] {event['event_type']}: {event.get('message', 'N/A')}")
-            
-    except Exception as e:
-        print(f"❌ 모니터링 실패: {e}")
-
-if __name__ == "__main__":
-    # 테스트 시나리오
-    test_cases = [
-        "월별 매출 데이터를 분석해주세요",
-        "고객 만족도 조사 보고서를 작성해주세요", 
-        "고객 문의에 대한 응답을 준비해주세요",
-        "신제품 출시 프로젝트 계획을 수립해주세요"
-    ]
-    
-    print("🚀 ProcessGPT 테스트 시작\n")
-    
-    for i, description in enumerate(test_cases, 1):
-        print(f"--- 테스트 {i} ---")
-        task_id = create_test_task(description)
-        
-        if task_id:
-            # 잠시 대기 후 진행상황 확인
-            import time
-            time.sleep(2)
-            monitor_task_progress(task_id)
-        
-        print("\n" + "="*50 + "\n")
-```
-
-실행하기:
-
-```bash
-python test_client.py
-```
-
-#### 4.3 실시간 모니터링
-
-작업 진행상황을 실시간으로 모니터링:
-
-```python
-import asyncio
-from supabase import create_client
-
-async def real_time_monitor():
-    """실시간 이벤트 모니터링"""
-    
-    supabase = create_client(
-        os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_ANON_KEY")
-    )
-    
-    print("📡 실시간 모니터링 시작...")
-    
-    while True:
-        try:
-            # 최근 이벤트 조회
-            events = supabase.table("events")\
-                .select("*, todolist!inner(description)")\
-                .order("created_at", desc=True)\
-                .limit(5)\
-                .execute()
-            
-            for event in events.data:
-                task_desc = event['todolist']['description'][:50] + "..."
-                print(f"[{event['created_at']}] {event['event_type']}: {task_desc}")
-            
-            await asyncio.sleep(5)  # 5초마다 체크
-            
-        except KeyboardInterrupt:
-            print("\n모니터링 중지")
-            break
-        except Exception as e:
-            print(f"모니터링 오류: {e}")
-            await asyncio.sleep(5)
-
-# 실행
-asyncio.run(real_time_monitor())
-```
 
 ---
 
 ## 🎮 ProcessGPT Agent Simulator
 
 **데이터베이스 연결 없이** ProcessGPT 에이전트를 시뮬레이션할 수 있는 완전한 툴킷이 제공됩니다. 개발, 테스트, 데모 목적으로 사용할 수 있습니다.
-
-### 🚀 빠른 시작
-
-#### 독립적인 시뮬레이터 (추천)
-
-```bash
-# 기본 시뮬레이션 실행
-python3 simulate_standalone.py "데이터를 분석해주세요"
-
-# 빠른 실행 (지연 시간 단축)
-python3 simulate_standalone.py "보고서를 작성해주세요" --delay 0.3
-
-# 상세 로그와 함께
-python3 simulate_standalone.py "고객 문의를 처리해주세요" --verbose
-
-# 도움말 보기
-python3 simulate_standalone.py --help
-```
-
-#### 의존성이 있는 시뮬레이터
-
-```bash
-# 간단한 시뮬레이션 실행
-python processgpt_simulator_cli.py "데이터를 분석해주세요"
-
-# 또는 shell script 사용
-./simulate.sh "보고서를 작성해주세요"
-
-# 고급 옵션
-python processgpt_simulator_cli.py "프로젝트를 계획해주세요" --steps 8 --delay 0.5
-```
 
 ### 🎯 주요 특징
 
@@ -519,15 +365,6 @@ python processgpt_simulator_cli.py "프로젝트를 계획해주세요" --steps 
 - **사용자 정의 가능**: 자체 실행기 구현 지원
 - **다양한 시뮬레이션 모드**: 단계별 진행, 지연 시간 조정 등
 
-### 🧠 지원하는 프로세스 타입
-
-시뮬레이터는 프롬프트를 분석하여 자동으로 적절한 프로세스를 선택합니다:
-
-- **데이터 분석**: 데이터 수집 → 정제 → 분석 → 결과 생성 → 시각화
-- **보고서 작성**: 요구사항 분석 → 구조 설계 → 내용 작성 → 검토
-- **고객 서비스**: 문의 분석 → 솔루션 검색 → 응답 준비
-- **프로젝트 관리**: 분석 → 계획 → 리소스 할당 → 위험 평가
-- **일반 작업**: 작업 분석 → 처리 수행 → 결과 생성
 
 ### 📊 출력 형태
 
@@ -552,29 +389,6 @@ python processgpt_simulator_cli.py "프로젝트를 계획해주세요" --steps 
 }
 ```
 
-#### 이벤트 타입
-
-- `task_started`: 작업 시작
-- `progress`: 진행 상황 업데이트
-- `output`: 중간/최종 결과 출력
-- `done`: 작업 완료
-- `cancelled`: 작업 취소
-- `error`: 오류 발생
-
-### 📋 CLI 옵션
-
-| 옵션 | 설명 | 기본값 |
-|------|------|--------|
-| `prompt` | 에이전트가 처리할 프롬프트 메시지 | (필수) |
-| `--agent-orch` | 에이전트 오케스트레이션 타입 | `simulator` |
-| `--activity-name` | 활동 이름 | `simulation_task` |
-| `--user-id` | 사용자 ID | 자동 생성 |
-| `--tenant-id` | 테넌트 ID | 자동 생성 |
-| `--tool` | 사용할 도구 | `default` |
-| `--feedback` | 피드백 메시지 | (빈 문자열) |
-| `--steps` | 시뮬레이션 단계 수 | `5` (프로세스별 자동 결정) |
-| `--delay` | 각 단계별 대기 시간(초) | `1.0` |
-| `--verbose` | 상세한 로그 출력 | `false` |
 
 ### 시뮬레이터에서 사용자 정의 실행기 사용
 
@@ -606,78 +420,6 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 📁 실제 사용 예제
-
-#### 데이터 분석 시뮬레이션
-
-```bash
-# 독립적 시뮬레이터 사용
-python3 simulate_standalone.py "월별 매출 데이터를 분석하고 트렌드를 파악해주세요" \
-  --agent-orch "data_analyst" \
-  --delay 0.5 \
-  --verbose
-
-# 의존성 있는 시뮬레이터 사용  
-python processgpt_simulator_cli.py "고객 행동 패턴을 분석해주세요" \
-  --steps 6 \
-  --delay 2.0
-```
-
-#### 고객 서비스 시뮬레이션
-
-```bash
-python3 simulate_standalone.py "제품 반품 문의에 대한 응답을 준비해주세요" \
-  --agent-orch "customer_service" \
-  --activity-name "return_inquiry" \
-  --feedback "고객은 배송 지연을 이유로 반품을 요청했습니다"
-```
-
-#### 프로젝트 관리 시뮬레이션
-
-```bash
-python3 simulate_standalone.py "신제품 출시를 위한 프로젝트 계획을 수립해주세요" \
-  --agent-orch "project_manager" \
-  --delay 1.5
-```
-
-### 🔍 로그 및 디버깅
-
-#### 이벤트 필터링
-
-```bash
-# 진행 상황 이벤트만 출력
-python3 simulate_standalone.py "테스트" | grep '\[EVENT\]' | jq '.event | select(.type == "progress")'
-
-# 최종 결과만 출력
-python3 simulate_standalone.py "테스트" | grep '\[EVENT\]' | jq '.event | select(.type == "output")'
-
-# 특정 프로세스 타입만 필터링
-python3 simulate_standalone.py "데이터 분석" | grep "데이터 분석"
-```
-
-#### CI/CD 통합
-
-```yaml
-# .github/workflows/test.yml
-name: Agent Simulation Tests
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v2
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: '3.9'
-    
-    - name: Run Agent Simulation Tests
-      run: |
-        python3 simulate_standalone.py "테스트 시나리오 1" --delay 0.1
-        python3 simulate_standalone.py "테스트 시나리오 2" --delay 0.1
-        python3 simulate_standalone.py "테스트 시나리오 3" --delay 0.1
-```
 
 ## 🔄 워크플로우
 
@@ -776,216 +518,8 @@ sequenceDiagram
 
 ### CrewAI 통합 예제
 
-```python
-from crewai import Agent, Task, Crew
-import asyncio
+https://github.com/uengine-oss/process-gpt-crewai-action/blob/main/crewai_action_executor.py
 
-class CrewAIAgentExecutor(AgentExecutor):
-    """CrewAI를 활용한 AgentExecutor"""
-    
-    def __init__(self):
-        self.is_cancelled = False
-        
-        # CrewAI 에이전트 설정
-        self.researcher = Agent(
-            role='Senior Researcher',
-            goal='Conduct thorough research and provide accurate information',
-            backstory='An experienced researcher with attention to detail',
-            verbose=True
-        )
-        
-        self.analyst = Agent(
-            role='Data Analyst',
-            goal='Analyze data and extract meaningful insights',
-            backstory='A skilled analyst with expertise in data interpretation',
-            verbose=True
-        )
-    
-    async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        user_input = context.get_user_input()
-        
-        # 시작 이벤트
-        start_event = Event(
-            type="task_started",
-            data={"message": f"CrewAI 에이전트 시작: {user_input}"}
-        )
-        event_queue.enqueue_event(start_event)
-        
-        try:
-            # CrewAI 태스크 생성
-            research_task = Task(
-                description=f"Research the following topic: {user_input}",
-                agent=self.researcher,
-                expected_output="Comprehensive research findings"
-            )
-            
-            analysis_task = Task(
-                description="Analyze the research findings and provide insights",
-                agent=self.analyst,
-                expected_output="Detailed analysis with actionable insights"
-            )
-            
-            # Crew 생성 및 실행
-            crew = Crew(
-                agents=[self.researcher, self.analyst],
-                tasks=[research_task, analysis_task],
-                verbose=True
-            )
-            
-            # 진행 상황 이벤트
-            progress_event = Event(
-                type="progress",
-                data={"message": "CrewAI 에이전트들이 작업을 수행하고 있습니다..."}
-            )
-            event_queue.enqueue_event(progress_event)
-            
-            # 비동기 실행
-            result = await asyncio.to_thread(crew.kickoff)
-            
-            # 결과 이벤트
-            output_event = Event(
-                type="output",
-                data={
-                    "content": {
-                        "crew_result": str(result),
-                        "agents_used": ["Senior Researcher", "Data Analyst"]
-                    },
-                    "final": True
-                }
-            )
-            event_queue.enqueue_event(output_event)
-            
-            # 완료 이벤트
-            done_event = Event(
-                type="done",
-                data={"message": "CrewAI 작업 완료", "success": True}
-            )
-            event_queue.enqueue_event(done_event)
-            
-        except Exception as e:
-            error_event = Event(
-                type="error",
-                data={"message": f"CrewAI 실행 오류: {str(e)}"}
-            )
-            event_queue.enqueue_event(error_event)
-            raise
-    
-    async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        self.is_cancelled = True
-        # CrewAI 취소 로직 구현
-```
-
-## 📊 모니터링
-
-시스템 상태를 모니터링하기 위한 유틸리티:
-
-```python
-from processgpt_utils import ProcessGPTMonitor
-
-monitor = ProcessGPTMonitor(supabase)
-
-# 시스템 통계 조회
-stats = await monitor.get_system_stats()
-print(f"Total tasks: {stats['total_tasks']}")
-print(f"Pending: {stats['pending_tasks']}")
-print(f"Completed: {stats['completed_tasks']}")
-
-# 최근 이벤트 조회
-recent_events = await monitor.get_recent_events(limit=10)
-```
-
-## 🔧 설정 옵션
-
-### 환경변수
-
-```bash
-# Supabase 설정
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_ANON_KEY=your-anon-key-here
-
-# 에이전트 설정
-DEFAULT_AGENT_TYPE=my_business_agent
-DEFAULT_POLLING_INTERVAL=5
-
-# 로깅
-LOG_LEVEL=INFO
-```
-
-### 서버 옵션
-
-```bash
-# 폴링 간격 설정 (초)
-python server.py --polling-interval 10
-
-# 특정 에이전트 타입만 처리
-python server.py --agent-type my-custom-agent
-```
-
-## 🐛 트러블슈팅
-
-### 시뮬레이터 관련
-
-1. **Import 오류**
-   - Python 경로가 올바르게 설정되었는지 확인
-   - 필요한 의존성이 설치되었는지 확인: `pip install -r requirements.txt`
-
-2. **Permission 오류**
-   - 스크립트 실행 권한 부여: `chmod +x simulate_standalone.py`
-   - 헬퍼 스크립트 권한 부여: `chmod +x simulate.sh`
-
-3. **시뮬레이션이 느리게 실행됨**
-   - `--delay` 옵션으로 단계별 지연 시간 단축: `--delay 0.1`
-   - `--steps` 옵션으로 단계 수 줄이기: `--steps 3`
-
-### 실제 서버 관련
-
-1. **Supabase 연결 실패**
-   - 환경변수 `SUPABASE_URL`과 `SUPABASE_ANON_KEY` 확인
-   - 네트워크 연결 상태 확인
-   - Supabase 프로젝트가 활성화되어 있는지 확인
-
-2. **폴링이 작동하지 않음**
-   - 데이터베이스 테이블이 올바르게 생성되었는지 확인
-   - `agent_orch`이 정확히 매칭되는지 확인
-   - 폴링 간격 설정 확인
-
-3. **이벤트가 저장되지 않음**
-   - Supabase RLS (Row Level Security) 정책 확인
-   - 테이블 권한 설정 확인
-   - API 키 권한 확인
-
-### 로그 확인
-
-```bash
-# 시뮬레이터 디버그 모드
-python3 simulate_standalone.py "테스트" --verbose
-
-# 실제 서버 디버그 모드
-LOG_LEVEL=DEBUG python server.py
-
-# 로그 간격 조정
-LOG_SPACED=0 python3 simulate_standalone.py "테스트"
-```
-
-### 성능 최적화
-
-```bash
-# 빠른 테스트를 위한 설정
-python3 simulate_standalone.py "테스트" --delay 0.1 --steps 2
-
-# 배치 테스트
-for prompt in "분석" "보고서" "고객서비스"; do
-  python3 simulate_standalone.py "$prompt 작업" --delay 0.1
-done
-```
-
-## 🤝 기여
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
 
 ## 📄 라이선스
 
