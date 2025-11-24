@@ -440,3 +440,26 @@ async def fetch_tenant_mcp(tenant_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     return resp.data.get("mcp") if resp and getattr(resp, "data", None) else None
+
+async def fetch_proc_inst_sources(proc_inst_id: str) -> List[Dict[str, Any]]:
+    """proc_inst_id로 프로세스 인스턴스 소스 목록 조회 함수"""
+    if not proc_inst_id:
+        return []
+
+    def _call():
+        client = get_db_client()
+        resp = (
+            client.table("proc_inst_source")
+            .select("*")
+            .eq("proc_inst_id", proc_inst_id)
+            .execute()
+        )
+        return resp.data or []
+
+    try:
+        rows = await _async_retry(_call, name="fetch_proc_inst_sources", fallback=lambda: [])
+    except Exception as e:
+        logger.error("fetch_proc_inst_sources fatal: %s", str(e), exc_info=e)
+        rows = []
+
+    return rows

@@ -16,6 +16,7 @@ from .database import (
     fetch_users_grouped,
     fetch_email_users_by_proc_inst_id,
     fetch_tenant_mcp,
+    fetch_proc_inst_sources,
 )
 from .utils import (
     summarize_error_to_user,
@@ -39,6 +40,7 @@ __all__ = [
     "fetch_users_grouped",
     "fetch_email_users_by_proc_inst_id",
     "fetch_tenant_mcp",
+    "fetch_proc_inst_sources",
     "summarize_error_to_user",
     "summarize_feedback",
     "run_single_todo_readonly",

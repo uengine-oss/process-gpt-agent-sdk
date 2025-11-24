@@ -25,6 +25,7 @@ from .database import (
     fetch_users_grouped,
     fetch_email_users_by_proc_inst_id,
     fetch_tenant_mcp,
+    fetch_proc_inst_sources,
 )
 from .utils import summarize_error_to_user, summarize_feedback, set_agent_model
 
@@ -117,9 +118,10 @@ class ProcessGPTRequestContext(RequestContext):
             mcp_task = fetch_tenant_mcp(tenant_id)
             form_task = fetch_form_def(tool_val, tenant_id)
             users_task = fetch_users_grouped(user_id_list)
+            sources_task = fetch_proc_inst_sources(effective_proc_inst_id)
 
-            notify_emails, tenant_mcp, form_tuple, users_group = await asyncio.gather(
-                notify_task, mcp_task, form_task, users_task
+            notify_emails, tenant_mcp, form_tuple, users_group, sources = await asyncio.gather(
+                notify_task, mcp_task, form_task, users_task, sources_task
             )
             form_id, form_fields, form_html = form_tuple
             agents, users = users_group
@@ -181,6 +183,21 @@ class ProcessGPTRequestContext(RequestContext):
             else:
                 logger.info("• %s 테넌트에 연결된 MCP 설정 정보가 존재하지 않습니다.", tenant_id)
             
+            # Sources 정보
+            if sources:
+                source_info = []
+                for s in sources:
+                    file_name = s.get("file_name", "")
+                    file_path = s.get("file_path", "")
+                    source_str = f"{file_name}"
+                    if file_path:
+                        source_str += f" ({file_path})"
+                    if source_str:
+                        source_info.append(source_str)
+                logger.info("• Sources (%d개): %s", len(sources), ", ".join(source_info[:3]) + ("..." if len(sources) > 3 else ""))
+            else:
+                logger.info("• Sources: 없음")
+            
             # 피드백 처리
             feedback_data = self.row.get("feedback")
             content_data = self.row.get("output") or self.row.get("draft")
@@ -211,6 +228,7 @@ class ProcessGPTRequestContext(RequestContext):
                 "notify_user_emails": notify_emails,
                 "summarized_feedback": summarized_feedback,
                 "sensitive_data": self.row.get("sensitive_data") or "{}",
+                "sources": sources,
             }
             
             logger.info("\n\n🎉 [컨텍스트 준비 완료] 모든 데이터 준비됨")
