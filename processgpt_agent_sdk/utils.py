@@ -1,7 +1,9 @@
 import os
 import logging
 import traceback
-from typing import Any, Dict, Optional, List
+import uuid
+from typing import Any, Dict, Optional, List, Union, BinaryIO
+from pathlib import Path
 from llm_factory import create_llm
 
 
@@ -206,3 +208,192 @@ def _get_feedback_system_prompt() -> str:
 - 자연스럽고 통합된 피드백으로 작성
 - 구체적인 요구사항과 개선사항을 누락 없이 포함
 - 다음 작업자가 즉시 이해할 수 있도록 명확하게"""
+
+# ─────────────────────────────
+# 파일 관리 유틸
+# ─────────────────────────────
+async def upload_file_to_bucket(
+    file: BinaryIO,
+    file_name: str,
+    proc_inst_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    파일을 Supabase Storage 버킷에 업로드합니다.
+    
+    Args:
+        file: 업로드할 파일 객체 (BinaryIO) (필수)
+        file_name: 파일명 (필수, Storage에 저장될 경로로 사용됨)
+        proc_inst_id: 프로세스 인스턴스 ID (옵션)
+        
+    Note:
+        Content-Type은 파일 확장자를 기반으로 자동 감지됩니다.
+        파일은 "files" 버킷의 "uploads" 디렉토리에 file_name으로 저장됩니다.
+    
+    Returns:
+        업로드 결과 딕셔너리:
+        - success: 성공 여부 (bool)
+        - storage_path: Storage에 저장된 파일 경로
+        - public_url: 공개 URL (있는 경우)
+        - error: 에러 메시지 (실패 시)
+    
+    Example:
+        ```python
+        from processgpt_agent_sdk.utils import upload_file_to_bucket
+        
+        # 파일 업로드
+        with open("./document.pdf", "rb") as f:
+            result = await upload_file_to_bucket(
+                file=f,
+                file_name="document.pdf",
+                proc_inst_id="proc_inst_id_123"
+            )
+        
+        if result["success"]:
+            print(f"업로드 완료: {result['storage_path']}")
+        ```
+    """
+    from .database import get_db_client
+    import asyncio
+    import mimetypes
+    
+    def _upload_file() -> Dict[str, Any]:
+        """파일 업로드 (동기 함수)"""
+        try:
+            client = get_db_client()
+            
+            # 파일 크기 확인을 위해 파일 데이터 읽기 (나중에 사용)
+            current_pos = file.tell()
+            file.seek(0, 2)  # 파일 끝으로 이동
+            file_size = file.tell()
+            file.seek(current_pos)  # 원래 위치로 복원
+            
+            # 파일명에 UUID 추가하여 중복 방지
+            file_path = Path(file_name)
+            file_stem = file_path.stem
+            file_suffix = file_path.suffix
+            unique_id = str(uuid.uuid4())[:8]  # UUID의 앞 8자리만 사용
+            actual_file_name = f"{file_stem}_{unique_id}{file_suffix}"
+            
+            # Storage 경로는 uploads 디렉토리에 파일명으로 저장
+            final_storage_path = f"uploads/{actual_file_name}"
+            
+            # Content-Type 자동 감지
+            detected_content_type, _ = mimetypes.guess_type(actual_file_name)
+            if not detected_content_type:
+                detected_content_type = "application/octet-stream"
+            
+            # Storage에 업로드
+            bucket_name = "files"
+            logger.info("📤 업로드 중: %s (버킷: %s)", final_storage_path, bucket_name)
+            
+            storage_api = client.storage.from_(bucket_name)
+            
+            # 파일 포인터를 처음으로 이동
+            file.seek(0)
+            
+            file_options = {"content-type": detected_content_type}
+            
+            response = storage_api.upload(
+                path=final_storage_path,
+                file=file,
+                file_options=file_options
+            )
+            
+            # 공개 URL 가져오기 (시도)
+            public_url = None
+            try:
+                public_url = storage_api.get_public_url(final_storage_path)
+            except Exception:
+                pass  # 공개 URL이 없어도 계속 진행
+            
+            logger.info("✅ 업로드 완료: %s", final_storage_path)
+            
+            # 파일 크기는 이미 업로드 전에 계산했으므로 그대로 사용
+            result = {
+                "success": True,
+                "storage_path": final_storage_path,
+                "file_name": actual_file_name,
+                "content_type": detected_content_type,
+                "size": file_size
+            }
+            
+            if public_url:
+                result["public_url"] = public_url
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"파일 업로드 실패: {str(e)}"
+            logger.error("❌ %s", error_msg, exc_info=e)
+            return {
+                "success": False,
+                "error": error_msg
+            }
+    
+    return await asyncio.to_thread(_upload_file)
+
+async def upload_files_to_bucket(
+    files: List[Dict[str, Any]],
+    proc_inst_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    여러 파일을 Supabase Storage 버킷에 업로드합니다.
+    
+    Args:
+        files: 업로드할 파일 정보 리스트. 각 항목은 다음 필드를 포함:
+            - file: 파일 객체 (BinaryIO) (필수)
+            - file_name: 파일명 (필수)
+            - proc_inst_id: 프로세스 인스턴스 ID (옵션, 전체 기본값보다 우선)
+        proc_inst_id: 프로세스 인스턴스 ID (옵션, 모든 파일에 적용, 개별 설정보다 우선순위 낮음)
+        
+    Note:
+        모든 파일은 "files" 버킷에 업로드됩니다.
+    
+    Returns:
+        업로드 결과 리스트 (각 항목은 upload_file_to_bucket의 반환 형식과 동일)
+    
+    Example:
+        ```python
+        from processgpt_agent_sdk.utils import upload_files_to_bucket
+        
+        files = [
+            {"file": open("./doc1.pdf", "rb"), "file_name": "doc1.pdf"},
+            {"file": open("./doc2.pdf", "rb"), "file_name": "doc2.pdf"},
+        ]
+        
+        results = await upload_files_to_bucket(
+            files=files,
+            proc_inst_id="proc_inst_id_123"
+        )
+        
+        for result in results:
+            if result["success"]:
+                print(f"✅ {result['storage_path']}")
+            else:
+                print(f"❌ {result['error']}")
+        ```
+    """
+    import asyncio
+    
+    if not files:
+        logger.info("📤 업로드할 파일이 없습니다")
+        return []
+    
+    logger.info("📤 파일 업로드 시작: %d개 파일", len(files))
+    
+    # 각 파일에 대해 업로드 실행 (병렬 처리)
+    upload_tasks = [
+        upload_file_to_bucket(
+            file=file_info.get("file"),
+            file_name=file_info.get("file_name"),
+            proc_inst_id=file_info.get("proc_inst_id", proc_inst_id)
+        )
+        for file_info in files
+    ]
+    
+    results = await asyncio.gather(*upload_tasks)
+    
+    success_count = sum(1 for r in results if r.get("success"))
+    logger.info("📤 업로드 완료: 성공 %d/%d", success_count, len(files))
+    
+    return results

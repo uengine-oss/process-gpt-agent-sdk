@@ -21,6 +21,8 @@ from .database import (
 from .utils import (
     summarize_error_to_user,
     summarize_feedback,
+    upload_file_to_bucket,
+    upload_files_to_bucket,
 )
 from .single_run import run_single_todo_readonly
 
@@ -43,5 +45,7 @@ __all__ = [
     "fetch_proc_inst_sources",
     "summarize_error_to_user",
     "summarize_feedback",
+    "upload_file_to_bucket",
+    "upload_files_to_bucket",
     "run_single_todo_readonly",
 ]
