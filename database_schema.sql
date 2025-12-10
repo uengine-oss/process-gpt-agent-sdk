@@ -42,7 +42,7 @@ create table public.todolist (
   status public.todo_status null,
   agent_mode public.agent_mode null,
   temp_feedback text null,
-  agent_orch public.agent_orch null,
+  agent_orch text null,
   draft_status public.draft_status null,
   root_proc_inst_id text null,
   execution_scope text null,
