@@ -3,6 +3,7 @@ import json
 import asyncio
 import socket
 from typing import Any, Dict, List, Optional, Tuple, Callable, TypeVar
+from importlib import resources
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -336,12 +337,43 @@ async def fetch_form_def(tool_val: str, tenant_id: str) -> Tuple[str, List[Dict[
     return (form_id or "freeform", res["fields"], res.get("html"))
 
 
+def _load_default_settings() -> Dict[str, Any]:
+    """default_settings.json 파일에서 기본 설정을 로드하는 함수"""
+    try:
+        try:
+            # Python 3.9+ 방식
+            if hasattr(resources, 'files'):
+                with resources.files('processgpt_agent_sdk').joinpath('default_settings.json').open('r', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                # Python 3.7-3.8 방식
+                with resources.open_text('processgpt_agent_sdk', 'default_settings.json', encoding='utf-8') as f:
+                    data = json.load(f)
+        except (FileNotFoundError, ModuleNotFoundError):
+            # 패키지로 설치되지 않은 경우 (개발 환경) fallback
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            settings_json_path = os.path.join(current_dir, "default_settings.json")
+            if not os.path.exists(settings_json_path):
+                logger.warning("default_settings.json 파일을 찾을 수 없습니다: %s", settings_json_path)
+                return {"default_agents": [], "default_mcp": None}
+            with open(settings_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        
+        return {
+            "default_agents": data.get("default_agents", []),
+            "default_mcp": data.get("default_mcp")
+        }
+    except Exception as e:
+        logger.error("default_settings.json 로드 실패: %s", str(e), exc_info=e)
+        return {"default_agents": [], "default_mcp": None}
+
 async def fetch_users_grouped(user_ids: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """해당 todo에서 사용자 목록과 에이전트 목록 조회하는는 함수"""
+    """해당 todo에서 사용자 목록과 에이전트 목록 조회하는 함수 (DB + default_settings.json)"""
     ids = [u for u in (user_ids or []) if u]
     if not ids:
         return ([], [])
 
+    # DB에서 조회
     def _call():
         client = get_db_client()
         resp = (
@@ -359,12 +391,32 @@ async def fetch_users_grouped(user_ids: List[str]) -> Tuple[List[Dict[str, Any]]
         logger.error("fetch_users_grouped fatal: %s", str(e), exc_info=e)
         rows = []
 
+    # default_settings.json에서 기본 에이전트 조회
+    default_settings = _load_default_settings()
+    default_agents = default_settings.get("default_agents", [])
+    ids_set = set(ids)
+    
+    # DB에서 조회된 ID 집합 (중복 제거를 위해)
+    db_ids_set = {r.get("id") for r in rows if r.get("id")}
+    
+    # default_settings.json에서 요청된 ID에 해당하는 에이전트 찾기 (DB에 없는 것만)
+    json_agents = []
+    for agent in default_agents:
+        agent_id = agent.get("id")
+        if agent_id and agent_id in ids_set and agent_id not in db_ids_set:
+            json_agents.append(agent)
+
+    # DB 결과와 JSON 결과 병합
     agents, users = [], []
     for r in rows:
         if r.get("is_agent") is True:
             agents.append(r)
         else:
             users.append(r)
+    
+    # JSON에서 찾은 에이전트 추가
+    agents.extend(json_agents)
+    
     return (agents, users)
 
 async def fetch_email_users_by_proc_inst_id(proc_inst_id: str) -> str:
@@ -419,10 +471,16 @@ async def fetch_email_users_by_proc_inst_id(proc_inst_id: str) -> str:
     return ",".join(emails) if emails else ""
 
 async def fetch_tenant_mcp(tenant_id: str) -> Optional[Dict[str, Any]]:
-    """mcp 설정 조회 함수"""
+    """mcp 설정 조회 함수 (DB + default_settings.json의 기본 MCP 병합)"""
+    # 기본 MCP 로드
+    default_settings = _load_default_settings()
+    default_mcp = default_settings.get("default_mcp")
+    
     if not tenant_id:
-        return None
+        # tenant_id가 없으면 기본 MCP만 반환
+        return default_mcp
 
+    # DB에서 tenant의 MCP 조회
     def _call():
         client = get_db_client()
         return (
@@ -437,9 +495,30 @@ async def fetch_tenant_mcp(tenant_id: str) -> Optional[Dict[str, Any]]:
         resp = await _async_retry(_call, name="fetch_tenant_mcp", fallback=lambda: None)
     except Exception as e:
         logger.error("fetch_tenant_mcp fatal: %s", str(e), exc_info=e)
-        return None
+        resp = None
 
-    return resp.data.get("mcp") if resp and getattr(resp, "data", None) else None
+    db_mcp = resp.data.get("mcp") if resp and getattr(resp, "data", None) else None
+    
+    # 기본 MCP와 DB MCP 병합 (DB MCP가 우선, 기본 MCP는 보완)
+    if not db_mcp:
+        return default_mcp
+    
+    if not default_mcp:
+        return db_mcp
+    
+    # 두 MCP 병합: DB MCP의 mcpServers를 우선하고, 기본 MCP의 mcpServers로 보완
+    merged_mcp = db_mcp.copy() if isinstance(db_mcp, dict) else {}
+    
+    if isinstance(default_mcp, dict) and "mcpServers" in default_mcp:
+        if "mcpServers" not in merged_mcp:
+            merged_mcp["mcpServers"] = {}
+        
+        # 기본 MCP의 서버들을 추가 (DB에 없는 것만)
+        for server_name, server_config in default_mcp["mcpServers"].items():
+            if server_name not in merged_mcp["mcpServers"]:
+                merged_mcp["mcpServers"][server_name] = server_config
+    
+    return merged_mcp
 
 async def fetch_proc_inst_sources(proc_inst_id: str) -> List[Dict[str, Any]]:
     """proc_inst_id로 프로세스 인스턴스 소스 목록 조회 함수"""

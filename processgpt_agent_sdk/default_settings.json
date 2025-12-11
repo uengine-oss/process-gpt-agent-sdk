@@ -1,0 +1,69 @@
+{
+    "default_agents": [
+        {
+            "id": "8e9df0ec-142b-3ba3-518b-b49395592187",
+            "username": "OpenAI 고급 분석",
+            "profile": "/images/chat-icon.png",
+            "email": null,
+            "role": "",
+            "goal": "",
+            "persona": "",
+            "description": "GPT-4 기반의 고급 추론과 체계적 분석을 통한 연구. ex) 논리적 사고, 창의적 문제해결 (3~10분 소요)",
+            "tools": "",
+            "skills": null,
+            "is_agent": true,
+            "model": null,
+            "endpoint": "",
+            "agent_type": "pgagent",
+            "alias": "openai-deep-research"
+        },
+        {
+            "id": "79014ea6-ba74-5a8c-9293-cacd516c83e0",
+            "username": "브라우저 자동화 에이전트",
+            "profile": "/images/chat-icon.png",
+            "email": null,
+            "role": "",
+            "goal": "",
+            "persona": "",
+            "description": "브라우저 자동화 에이전트",
+            "tools": "",
+            "skills": null,
+            "is_agent": true,
+            "model": null,
+            "endpoint": "",
+            "agent_type": "pgagent",
+            "alias": "browser-automation-agent"
+        },
+        {
+            "id": "97e74b9e-44c9-0451-762e-38c8055017c3",
+            "username": "이미지 분석",
+            "profile": "/images/chat-icon.png",
+            "email": null,
+            "role": "",
+            "goal": "",
+            "persona": "",
+            "description": "이미지 분석 및 텍스트 추출",
+            "tools": "",
+            "skills": null,
+            "is_agent": true,
+            "model": null,
+            "endpoint": "",
+            "agent_type": "pgagent",
+            "alias": "visionparse"
+        }
+    ],
+    "default_mcp": {
+        "mcpServers": {
+            "claude-skills": {
+                "url": "http://claude-skills:8765/mcp",
+                "type": "http",
+                "is_default": true
+            },
+            "computer-use": {
+                "url": "http://computer-use:8000/mcp",
+                "type": "http",
+                "is_default": true
+            }
+        }
+    }
+}
