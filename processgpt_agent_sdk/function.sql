@@ -21,11 +21,6 @@ BEGIN
       SELECT t.id
       FROM todolist AS t
       WHERE t.status = 'IN_PROGRESS'
-        -- env 분기
-        AND (
-              (p_env = 'dev' AND t.tenant_id = 'uengine')
-           OR (p_env <> 'dev' AND t.tenant_id <> 'uengine')
-        )
         -- agent_orch 필터(옵션)
         AND (p_agent_orch IS NULL OR p_agent_orch = '' OR t.agent_orch::text = p_agent_orch)
         -- 처리 대상 선택 로직

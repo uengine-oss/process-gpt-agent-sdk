@@ -4,17 +4,42 @@ import traceback
 import uuid
 from typing import Any, Dict, Optional, List, Union, BinaryIO
 from pathlib import Path
-from llm_factory import create_llm
+import litellm
 
 
 logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────
-# Lazy Singleton LLM Client
+# LLM Client (litellm 기반)
 # ─────────────────────────────
 _client = None
 _global_agent_model = None
+
+
+class LiteLLMClient:
+    def __init__(self, model: str, temperature: float = 0, provider: Optional[str] = None) -> None:
+        self.model = model
+        self.temperature = temperature
+        self.provider = provider
+
+    async def ainvoke(self, messages: List[Dict[str, str]]) -> str:
+        model_name = f"{self.provider}/{self.model}" if self.provider else self.model
+        response = await litellm.acompletion(
+            model=model_name,
+            messages=messages,
+            temperature=self.temperature,
+        )
+        # OpenAI 스타일 응답에서 content 추출
+        try:
+            return response.choices[0].message["content"]
+        except Exception:
+            # 예상치 못한 포맷인 경우 문자열로 캐스팅
+            return str(response)
+
+
+def create_llm(provider: Optional[str] = None, model: str = "gpt-4.1-mini", temperature: float = 0) -> LiteLLMClient:
+    return LiteLLMClient(model=model, temperature=temperature, provider=provider)
 
 def set_agent_model(agent: Optional[Dict[str, Any]]) -> None:
     """첫 번째 에이전트의 모델을 글로벌 변수에 설정합니다."""
