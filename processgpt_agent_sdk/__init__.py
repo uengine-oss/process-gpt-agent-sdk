@@ -21,9 +21,8 @@ from .database import (
 from .utils import (
     summarize_error_to_user,
     summarize_feedback,
-    upload_file_to_bucket,
-    upload_files_to_bucket,
 )
+from .integrations.storage import upload_file_to_bucket, upload_files_to_bucket
 from .single_run import run_single_todo_readonly
 
 __all__ = [

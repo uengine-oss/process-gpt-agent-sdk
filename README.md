@@ -153,3 +153,9 @@ async def main():
 ## 7. 버전업
 - ./release.sh 버전
 - 오류 발생시 : python -m ensurepip --upgrade
+
+## 8. integrations 모듈 안내
+- 스토리지 업로드 유틸은 `processgpt_agent_sdk.integrations.storage` 로 분리되었습니다.
+- 기존 `processgpt_agent_sdk.utils.upload_file_to_bucket`, `upload_files_to_bucket` 는 하위호환용으로 유지되지만 deprecated 입니다.
+- 신규 코드는 아래 경로를 사용하세요:
+  - `from processgpt_agent_sdk.integrations.storage import upload_file_to_bucket, upload_files_to_bucket`
