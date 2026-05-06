@@ -1411,7 +1411,7 @@ wheels = [
 
 [[package]]
 name = "process-gpt-agent-sdk"
-version = "0.4.16"
+version = "0.4.17"
 source = { editable = "." }
 dependencies = [
     { name = "a2a-sdk" },
