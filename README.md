@@ -44,6 +44,26 @@ flowchart TD
 | **TaskStatusUpdateEvent** | 작업 상태 업데이트 | `events` 테이블 |
 | **TaskArtifactUpdateEvent** | 작업 결과물 업데이트 | `todolist` 테이블 |
 
+### (v1.0) Enum 변경사항: `snake_case` → `SCREAMING_SNAKE_CASE`
+
+`a2a-sdk` v1.0부터 A2A 스펙(ProtoJSON) 정합성을 위해 **모든 enum 값이 대문자 스네이크 케이스로 표준화**되었습니다.
+
+- **TaskState**
+  - `TaskState.submitted` → `TaskState.TASK_STATE_SUBMITTED`
+  - `TaskState.working` → `TaskState.TASK_STATE_WORKING`
+  - `TaskState.completed` → `TaskState.TASK_STATE_COMPLETED`
+  - `TaskState.failed` → `TaskState.TASK_STATE_FAILED`
+  - `TaskState.canceled` → `TaskState.TASK_STATE_CANCELED`
+  - `TaskState.input_required` → `TaskState.TASK_STATE_INPUT_REQUIRED`
+  - `TaskState.auth_required` → `TaskState.TASK_STATE_AUTH_REQUIRED`
+  - `TaskState.rejected` → `TaskState.TASK_STATE_REJECTED`
+  - (추가) `TaskState.TASK_STATE_UNSPECIFIED`
+
+- **Role**
+  - `Role.user` → `Role.ROLE_USER`
+  - `Role.agent` → `Role.ROLE_AGENT`
+  - (추가) `Role.ROLE_UNSPECIFIED`
+
 ### Event Type (4가지)
 | Event Type | Python 클래스 | 저장 테이블 | 설명 |
 |------------|---------------|-------------|------|
@@ -56,65 +76,103 @@ flowchart TD
 
 ---
 
-## 4. 미니멀 예제 (기본 사용법)
+## 4. 사용 예시
 
-### minimal_executor.py
+이 SDK는 “하나의 완제품 서비스”가 아니라, **내 서비스에 붙여서 사용하는 프레임워크/라이브러리**입니다.
+
+아래 예시는 한 프로세스에서 다음을 동시에 제공합니다.
+
+- **프로세스(폴링)**: `await server.run()`로 DB에서 todo를 가져와 처리
+- **채팅(SSE)**: `/chat/stream` 엔드포인트로 요청을 받아 `Message-only`로 응답 + `chats`에 저장
+
+### 4.1 서버 구성 예시 (폴링 + SSE 함께)
+
 ```python
-class MinimalExecutor(AgentExecutor):
-    async def execute(self, context: RequestContext, event_queue: EventQueue):
-        # 1) 입력 가져오기
-        query = context.get_user_input()
-        print("User Query:", query)
+import asyncio
 
-        # 2) 상태 이벤트 (events 테이블 저장)
-        payload = {"demo": "hello world"}
-        event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                status={
-                    "state": TaskState.working,
-                    "message": new_agent_text_message(
-                        json.dumps(payload, ensure_ascii=False),  # ⚠️ str() 쓰지말고 반드시 json.dumps!
-                        context.get_context_data()["row"]["proc_inst_id"],
-                        context.get_context_data()["row"]["id"],
-                    ),
-                },
-                contextId=context.get_context_data()["row"]["proc_inst_id"],
-                taskId=context.get_context_data()["row"]["id"],
-                metadata={"crew_type": "action", "event_type": "task_started"},
-            )
-        )
+import uvicorn
+from starlette.applications import Starlette
 
-        # 3) 최종 아티팩트 이벤트 (todolist 테이블 저장)
-        artifact = new_text_artifact(
-            name="result",
-            description="Demo Result",
-            text=json.dumps(payload, ensure_ascii=False),  # ⚠️ 여기서도 str() 금지!
-        )
-        event_queue.enqueue_event(
-            TaskArtifactUpdateEvent(
-                artifact=artifact,
-                lastChunk=True,
-                contextId=context.get_context_data()["row"]["proc_inst_id"],
-                taskId=context.get_context_data()["row"]["id"],
-            )
-        )
-```
+from processgpt_agent_sdk import ProcessGPTAgentServer
+from my_service.my_executor import MyExecutor
 
-### minimal_server.py
-```python
+
 async def main():
-    load_dotenv()
     server = ProcessGPTAgentServer(
-        agent_executor=MinimalExecutor(),
-        agent_type="crewai-action"  # 오케스트레이터 타입
+        agent_executor=MyExecutor(),
+        agent_type="langchain-react",
     )
-    await server.run()
+
+    app = Starlette()
+    server.mount_chat_sse(app, path="/chat/stream")
+
+    uvicorn_server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=8010, log_level="info")
+    )
+
+    await asyncio.gather(
+        server.run(),
+        uvicorn_server.serve(),
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-👉 실행하면 SDK가 자동으로:
-1. DB에서 작업 하나 가져오기 (`fetch_pending_task`)  
-2. 컨텍스트 준비 (폼/유저/MCP 조회)  
-3. Executor 실행 → 이벤트/결과 DB에 저장  
+### 4.2 Executor 구현 예시 (채팅 저장 payload 커스텀)
+
+```python
+from a2a.helpers import new_text_message
+from a2a.types import Role
+from processgpt_agent_sdk.chat_mode import ChatRequestContext
+
+
+class MyExecutor(...):
+    async def execute(self, context, event_queue):
+        # 채팅(SSE) 요청이면 Message-only로 응답하고,
+        # Message.metadata.chat_payload를 chats.messages에 그대로 저장합니다.
+        if isinstance(context, ChatRequestContext):
+            text = f"[chat] {context.get_user_input()}"
+            msg = new_text_message(text=text, role=Role.ROLE_AGENT)
+            msg.metadata.update(
+                {
+                    "chat_payload": {
+                        # 이 payload는 외부 서비스가 원하는 형태로 자유롭게 구성하세요.
+                        "role": "assistant",
+                        "content": text,
+                        "conversation_id": context.req.conversation_id,
+                        "tenant_id": context.req.tenant_id,
+                        "user_uid": context.req.user_uid,
+                    }
+                }
+            )
+            await event_queue.enqueue_event(msg)
+            return
+
+        # 그 외(폴링)는 Task lifecycle 패턴으로 처리 (Task → status/artifact)
+        ...
+```
+
+### 4.3 채팅(SSE) 요청 예시
+
+요청 바디 예시:
+
+```bash
+curl -N -X POST http://127.0.0.1:8010/chat/stream \
+  -H 'content-type: application/json' \
+  -d '{"message":"hello","conversation_id":"conv-1","tenant_id":"","user_uid":"u1"}'
+```
+
+### 4.4 설치(옵션: SSE)
+
+채팅(SSE)을 포함해 사용하려면 extras가 필요합니다.
+
+```bash
+pip install "process-gpt-agent-sdk[sse]"
+```
+
+참고로, 레포에는 빠르게 확인할 수 있는 샘플(`sample_server/minimal_server.py`, `sample_server/minimal_executor.py`)도 포함되어 있습니다.
 
 ---
 
@@ -138,17 +196,95 @@ async def main():
 
 ---
 
-## 6. 요약
-- 이 SDK는 **ProcessGPT Agent**를 표준 규격으로 실행/저장/호출하는 공통 레이어  
-- 작업 → 컨텍스트 준비 → Executor 실행 → 이벤트 저장 전체를 자동화  
-- **A2A 타입 2가지**: `TaskStatusUpdateEvent`, `TaskArtifactUpdateEvent`  
-- **Event Type 4가지**: `task_started`, `task_working`, `task_completed`, `task_error`  
-- **DB 매핑**:  
-  - `TaskStatusUpdateEvent` → `events` 테이블  
-  - `TaskArtifactUpdateEvent` → `todolist` 테이블  
-- ⚠️ **str() 대신 무조건 `json.dumps` 사용!**
+## 6. 사용법 (내 코드에 붙이기)
+
+핵심은 사용자 `AgentExecutor.execute()`가 **요청 경로에 따라** 아래 둘 중 하나를 선택하는 것입니다.
+
+- **프로세스(폴링) 경로**: `Task lifecycle` (Task → status/artifact)
+  - 첫 이벤트는 반드시 `Task`
+  - 이후 `TaskStatusUpdateEvent` / `TaskArtifactUpdateEvent`만
+- **채팅(SSE) 경로**: `Message-only` (Message 1개)
+  - 정확히 1개의 `Message`만
+  - status/artifact/Task를 섞지 않음
+
+### 6.1 프로세스(폴링)만 실행
+
+```python
+from processgpt_agent_sdk import ProcessGPTAgentServer
+
+server = ProcessGPTAgentServer(agent_executor=MyExecutor(), agent_type="crewai-action")
+await server.run()
+```
+
+### 6.2 채팅(SSE) 엔드포인트 추가
+
+SSE를 쓰려면 extras 설치가 필요합니다.
+
+```bash
+pip install "process-gpt-agent-sdk[sse]"
+```
+
+```python
+from starlette.applications import Starlette
+
+from processgpt_agent_sdk import ProcessGPTAgentServer
+
+server = ProcessGPTAgentServer(agent_executor=MyExecutor(), agent_type="crewai-action")
+app = Starlette()
+server.mount_chat_sse(app, path="/chat/stream")  # POST /chat/stream
+```
+
+요청 바디 예시:
+
+```json
+{
+  "message": "안녕",
+  "tenant_id": "t1",
+  "user_uid": "u1",
+  "user_email": "user@example.com",
+  "user_name": "홍길동",
+  "user_jwt": "",
+  "conversation_id": "conv-1",
+  "file": null,
+  "files": [],
+  "file_count": 0,
+  "stream": true,
+  "metadata": {}
+}
+```
+
+### 6.3 폴링 + SSE를 한 프로세스에서 함께 실행 (권장 예시)
+
+```python
+import asyncio
+
+import uvicorn
+from starlette.applications import Starlette
+
+from processgpt_agent_sdk import ProcessGPTAgentServer
 
 
+async def main():
+    server = ProcessGPTAgentServer(agent_executor=MyExecutor(), agent_type="crewai-action")
+
+    app = Starlette()
+    server.mount_chat_sse(app, path="/chat/stream")
+
+    uvicorn_server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=8010, log_level="info")
+    )
+
+    await asyncio.gather(
+        server.run(),
+        uvicorn_server.serve(),
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+운영 환경에서는 **폴링 프로세스**와 **HTTP API 프로세스**를 분리 운영하는 경우도 많습니다.
 
 ## 7. 버전업
 - ./release.sh 버전

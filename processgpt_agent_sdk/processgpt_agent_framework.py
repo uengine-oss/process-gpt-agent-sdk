@@ -10,15 +10,12 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
-from a2a.server.events import EventQueue, Event
-from a2a.types import TaskArtifactUpdateEvent, TaskState, TaskStatusUpdateEvent
+from a2a.server.events import EventQueue
 
 from .database import (
     initialize_db,
     polling_pending_todos,
-    record_events_bulk,
     record_event,
-    save_task_result,
     update_task_error,
     get_consumer_id,
     fetch_form_def,
@@ -28,6 +25,8 @@ from .database import (
     fetch_proc_inst_sources,
 )
 from .utils import summarize_error_to_user, summarize_feedback, set_agent_model
+from .event_queue_process import ProcessEventQueue, ProcessGPTEventQueue
+from .chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext, drain_sse_queue, persist_chat_to_db
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -41,53 +40,7 @@ class ContextPreparationError(Exception):
         self.original = original
         self.friendly = friendly
 
-# ------------------------------ Event Coalescing (env tunable) ------------------------------
-COALESCE_DELAY = float(os.getenv("EVENT_COALESCE_DELAY_SEC", "1.0"))  # 최대 지연
-COALESCE_BATCH = int(os.getenv("EVENT_COALESCE_BATCH", "3"))          # 즉시 flush 임계치
-
-_EVENT_BUF: list[Dict[str, Any]] = []
-_EVENT_TIMER: Optional[asyncio.TimerHandle] = None
-_EVENT_LOCK = asyncio.Lock()
-
-async def _flush_events_now():
-    """버퍼된 이벤트를 bulk RPC로 즉시 저장"""
-    global _EVENT_BUF, _EVENT_TIMER
-    async with _EVENT_LOCK:
-        buf = _EVENT_BUF[:]
-        _EVENT_BUF.clear()
-        if _EVENT_TIMER and not _EVENT_TIMER.cancelled():
-            _EVENT_TIMER.cancel()
-        _EVENT_TIMER = None
-    if not buf:
-        return
-    
-    logger.info("📤 이벤트 버퍼 플러시 시작 - %d개 이벤트", len(buf))
-    # 실제 성공/실패 로깅은 record_events_bulk 내부에서 수행
-    await record_events_bulk(buf)
-    # 여기서는 시도 사실만 남김(성공처럼 보이는 'flushed' 오해 방지)
-    logger.info("🔄 이벤트 버퍼 플러시 시도 완료 - %d개 이벤트", len(buf))
-
-def _schedule_delayed_flush():
-    global _EVENT_TIMER
-    if _EVENT_TIMER is None:
-        loop = asyncio.get_running_loop()
-        _EVENT_TIMER = loop.call_later(COALESCE_DELAY, lambda: asyncio.create_task(_flush_events_now()))
-
-async def enqueue_ui_event_coalesced(payload: Dict[str, Any]):
-    """1초 코얼레싱 / COALESCE_BATCH개 모이면 즉시 플러시 (환경변수로 조절 가능)"""
-    global _EVENT_BUF
-    to_flush_now = False
-    async with _EVENT_LOCK:
-        _EVENT_BUF.append(payload)
-        logger.info("📥 이벤트 버퍼에 추가 - 현재 %d개 (임계치: %d개)", len(_EVENT_BUF), COALESCE_BATCH)
-        if len(_EVENT_BUF) >= COALESCE_BATCH:
-            to_flush_now = True
-            logger.info("⚡ 임계치 도달 - 즉시 플러시 예정")
-        else:
-            _schedule_delayed_flush()
-            logger.info("⏰ 지연 플러시 스케줄링")
-    if to_flush_now:
-        await _flush_events_now()
+from .event_coalescer import flush_events_now, enqueue_ui_event_coalesced
 
 # ------------------------------ Request Context ------------------------------
 @dataclass
@@ -259,158 +212,6 @@ class ProcessGPTRequestContext(RequestContext):
     def get_context_data(self) -> Dict[str, Any]:
         return {"row": self.row, "extras": self._extra_context}
 
-# ------------------------------ Event Queue ------------------------------
-class ProcessGPTEventQueue(EventQueue):
-    def __init__(self, todolist_id: str, agent_orch: str, proc_inst_id: Optional[str]):
-        self.todolist_id = todolist_id
-        self.agent_orch = agent_orch
-        self.proc_inst_id = proc_inst_id
-        super().__init__()
-
-    def enqueue_event(self, event: Event):
-        try:
-            proc_inst_id_val = getattr(event, "contextId", None) or self.proc_inst_id
-            todo_id_val = getattr(event, "taskId", None) or str(self.todolist_id)
-            logger.info("\n\n📨 이벤트 수신: %s (task=%s)", type(event).__name__, self.todolist_id)
-
-            # 1) 결과물 저장
-            if isinstance(event, TaskArtifactUpdateEvent):
-                logger.info("📄 아티팩트 업데이트 이벤트 처리 중...")
-                is_final = bool(
-                    getattr(event, "final", None)
-                    or getattr(event, "lastChunk", None)
-                    or getattr(event, "last_chunk", None)
-                    or getattr(event, "last", None)
-                )
-                artifact_content = self._extract_payload(event)
-                logger.info("💾 아티팩트 저장 중... (final=%s)", is_final)
-                asyncio.create_task(save_task_result(self.todolist_id, artifact_content, is_final))
-                logger.info("✅ 아티팩트 저장 완료")
-                return
-
-            # 2) 상태 이벤트 저장(코얼레싱 → bulk)
-            if isinstance(event, TaskStatusUpdateEvent):
-                logger.info("📊 상태 업데이트 이벤트 처리 중...")
-                metadata = getattr(event, "metadata", None) or {}
-                crew_type_val = metadata.get("crew_type")
-                status_obj = getattr(event, "status", None)
-                state_val = getattr(status_obj, "state", None)
-                event_type_val = {TaskState.input_required: "human_asked"}.get(state_val) or metadata.get("event_type")
-                status_val = metadata.get("status")
-                job_id_val = metadata.get("job_id")
-                
-                logger.info("🔍 이벤트 메타데이터 분석 - event_type: %s, status: %s", event_type_val, status_val)
-                
-                payload: Dict[str, Any] = {
-                    "id": str(uuid.uuid4()),
-                    "job_id": job_id_val,
-                    "todo_id": str(todo_id_val),
-                    "proc_inst_id": proc_inst_id_val,
-                    "crew_type": crew_type_val,
-                    "event_type": event_type_val,
-                    "data": self._extract_payload(event),
-                    "status": status_val or None,
-                }
-                logger.info("📤 상태 이벤트 큐에 추가 중...")
-                asyncio.create_task(enqueue_ui_event_coalesced(payload))
-                logger.info("✅ 상태 이벤트 큐 추가 완료")
-                return
-
-        except Exception as e:
-            logger.error("❌ 이벤트 처리 실패: %s", str(e))
-            raise
-
-    def _extract_payload(self, event: Event) -> Any:
-        try:
-            artifact_or_none = getattr(event, "artifact", None)
-            status_or_none = getattr(event, "status", None)
-            message_or_none = getattr(status_or_none, "message", None)
-            source = artifact_or_none if artifact_or_none is not None else message_or_none
-            return self._parse_json_or_text(source)
-        except Exception as e:
-            logger.error("❌ [이벤트 페이로드 추출 실패] %s", str(e), exc_info=e)
-            return {}
-
-    def _parse_json_or_text(self, value: Any) -> Any:
-        if value is None:
-            return {}
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                return ""
-            # JSON인지 먼저 확인 (중괄호나 대괄호로 시작하는지)
-            if text.startswith(('{', '[')):
-                try:
-                    result = json.loads(text)
-                    return result
-                except json.JSONDecodeError as e:
-                    logger.debug("🔧 [JSON 파싱] JSON 파싱 실패 - 텍스트로 처리: %s", str(e))
-                    return text
-            else:
-                logger.debug("🔧 [JSON 파싱] 문자열은 JSON 형태가 아님 - 텍스트로 처리")
-                return text
-        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
-            value = value.model_dump()
-        elif not isinstance(value, dict) and hasattr(value, "dict") and callable(getattr(value, "dict")):
-            value = value.dict()
-        elif not isinstance(value, dict) and hasattr(value, "__dict__"):
-            value = value.__dict__
-        if isinstance(value, dict):
-            parts = value.get("parts")
-            if isinstance(parts, list) and parts:
-                first = parts[0] if isinstance(parts[0], dict) else None
-                if first and isinstance(first, dict):
-                    txt = first.get("text") or first.get("content") or first.get("data")
-                    if isinstance(txt, str):
-                        # JSON인지 먼저 확인 (중괄호나 대괄호로 시작하는지)
-                        txt_stripped = txt.strip()
-                        if txt_stripped.startswith(('{', '[')):
-                            try:
-                                result = json.loads(txt)
-                                return result
-                            except Exception as e:
-                                logger.debug("🔧 [JSON 파싱] parts 텍스트 JSON 파싱 실패 - 텍스트로 처리: %s", str(e))
-                                return txt
-                        else:
-                            logger.debug("🔧 [JSON 파싱] parts 텍스트는 JSON 형태가 아님 - 텍스트로 처리")
-                            return txt
-            top_text = value.get("text") or value.get("content") or value.get("data")
-            if isinstance(top_text, str):
-                # JSON인지 먼저 확인 (중괄호나 대괄호로 시작하는지)
-                top_text_stripped = top_text.strip()
-                if top_text_stripped.startswith(('{', '[')):
-                    try:
-                        result = json.loads(top_text)
-                        return result
-                    except Exception as e:
-                        logger.debug("🔧 [JSON 파싱] 최상위 텍스트 JSON 파싱 실패 - 텍스트로 처리: %s", str(e))
-                        return top_text
-                else:
-                    logger.debug("🔧 [JSON 파싱] 최상위 텍스트는 JSON 형태가 아님 - 텍스트로 처리")
-                    return top_text
-            return value
-        return value
-
-    def task_done(self) -> None:
-        try:
-            logger.info("🏁 작업 완료 이벤트 생성 중...")
-            payload: Dict[str, Any] = {
-                "id": str(uuid.uuid4()),
-                "job_id": "CREW_FINISHED",
-                "todo_id": str(self.todolist_id),
-                "proc_inst_id": self.proc_inst_id,
-                "crew_type": "crew",
-                "data": "Task completed successfully",
-                "event_type": "crew_completed",
-                "status": None,
-            }
-            logger.info("📤 작업 완료 이벤트 큐에 추가 중...")
-            asyncio.create_task(enqueue_ui_event_coalesced(payload))
-            logger.info("✅ 작업 완료 이벤트 기록 완료")
-        except Exception as e:
-            logger.error("❌ 작업 완료 이벤트 기록 실패: %s", str(e))
-            raise
-
 # ------------------------------ Agent Server ------------------------------
 class ProcessGPTAgentServer:
     def __init__(self, agent_executor: AgentExecutor, agent_type: str):
@@ -464,7 +265,7 @@ class ProcessGPTAgentServer:
 
         # 종료 시 남은 이벤트 강제 flush (오류로 간주하지 않음)
         try:
-            await _flush_events_now()
+            await flush_events_now()
             logger.info("🧹 graceful shutdown: pending events flushed")
         except Exception as e:
             logger.exception("flush on shutdown failed: %s", str(e))
@@ -493,7 +294,7 @@ class ProcessGPTAgentServer:
 
             # 2) 실행
             logger.info("\n\n🤖 [Agent Orchestrator 실행]")
-            event_queue = ProcessGPTEventQueue(str(task_id), self.agent_orch, row.get("proc_inst_id"))
+            event_queue = ProcessEventQueue(str(task_id), self.agent_orch, row.get("proc_inst_id"))
             await self.agent_executor.execute(context, event_queue)
             event_queue.task_done()
             logger.info("\n\n🎉 [Agent Orchestrator 완료] Task ID: %s", task_id)
@@ -560,3 +361,62 @@ class ProcessGPTAgentServer:
         self.is_running = False
         self._shutdown_event.set()
         logger.info("ProcessGPT Agent Server stopping...")
+
+    def mount_chat_sse(self, app: Any, *, path: str = "/chat/stream"):
+        """Starlette/FastAPI 앱에 채팅 SSE 엔드포인트를 마운트합니다.
+
+        - 코어 패키지에서는 Starlette/FastAPI를 강제 의존하지 않기 위해, import는 런타임에 수행합니다.
+        - 채팅 모드는 Message-only 패턴을 기대하며, record_events_bulk 경로를 사용하지 않습니다.
+        """
+        try:
+            # Optional dependency (installed via extras)
+            from starlette.responses import StreamingResponse  # type: ignore[reportMissingImports]
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "Starlette is required for mount_chat_sse(). Install with `process-gpt-agent-sdk[sse]`."
+            ) from e
+
+        async def handler(request):
+            # chats 테이블 저장을 위해 DB 연결 필요
+            initialize_db()
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+
+            req = ChatRequest(
+                message=str(body.get("message") or body.get("text") or ""),
+                tenant_id=str(body.get("tenant_id") or ""),
+                user_uid=str(body.get("user_uid") or body.get("user_id") or ""),
+                user_email=str(body.get("user_email") or ""),
+                user_name=str(body.get("user_name") or ""),
+                user_jwt=str(body.get("user_jwt") or ""),
+                conversation_id=body.get("conversation_id"),
+                file=body.get("file") if isinstance(body.get("file"), dict) else None,
+                files=list(body.get("files") or []) if isinstance(body.get("files") or [], list) else [],
+                file_count=int(body.get("file_count") or 0),
+                stream=bool(body.get("stream") if body.get("stream") is not None else True),
+                metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
+            )
+
+            out_q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+            ctx = ChatRequestContext(req)
+            q = ChatEventQueue(out_q, request=req, persist=persist_chat_to_db)
+
+            async def _run_executor():
+                try:
+                    await self.agent_executor.execute(ctx, q)
+                    await out_q.put({"type": "done"})
+                except Exception as ex:
+                    await out_q.put({"type": "error", "data": {"error": f"{type(ex).__name__}: {str(ex)}"}})
+
+            asyncio.create_task(_run_executor())
+            return StreamingResponse(drain_sse_queue(out_q), media_type="text/event-stream")
+
+        # FastAPI: add_api_route, Starlette: add_route
+        if hasattr(app, "add_api_route"):
+            app.add_api_route(path, handler, methods=["POST"])
+        elif hasattr(app, "add_route"):
+            app.add_route(path, handler, methods=["POST"])
+        else:  # pragma: no cover
+            raise TypeError("Unsupported app type: expected FastAPI or Starlette-like app with add_route/add_api_route.")

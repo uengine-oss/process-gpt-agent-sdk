@@ -277,6 +277,64 @@ async def save_task_result(todo_id: str, result: Any, final: bool = False) -> No
     else:
         logger.info("save_task_result ok todo_id=%s", todo_id)
 
+
+# ------------------------------ Chats ------------------------------
+async def insert_chat_message(
+    *,
+    uuid: str,
+    chat_id: str,
+    messages: Any,
+    tenant_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> None:
+    """채팅 메시지를 chats 테이블에 저장(insert)합니다. (1 row = 1 message)
+
+    - `uuid`: chats.uuid (PK)
+    - `chat_id`: chats.id (NOT NULL; 외부 서비스가 의미를 부여. 보통 conversation_id/thread_id를 권장)
+    - `messages`: chats.messages (jsonb)
+    - `tenant_id`: 선택. 미지정 시 DB default(public.tenant_id())에 위임될 수 있음
+    - `thread_id`: 선택
+    """
+    if not uuid:
+        raise ValueError("insert_chat_message requires uuid")
+    if not chat_id:
+        raise ValueError("insert_chat_message requires chat_id")
+
+    payload: Dict[str, Any] = {
+        "uuid": str(uuid),
+        "id": str(chat_id),
+        "messages": _to_jsonable(messages),
+    }
+    if tenant_id:
+        payload["tenant_id"] = tenant_id
+    if thread_id:
+        payload["thread_id"] = thread_id
+
+    def _call():
+        client = get_db_client()
+        return client.table("chats").insert(payload).execute()
+
+    res = await _async_retry(_call, name="insert_chat_message", retries=1, fallback=lambda: None)
+    if res is None and tenant_id:
+        # tenant_id FK가 맞지 않는 환경(로컬 샘플 등)에서는 tenant_id를 생략하고 한 번 더 시도
+        payload_wo_tenant = dict(payload)
+        payload_wo_tenant.pop("tenant_id", None)
+
+        def _call_wo_tenant():
+            client = get_db_client()
+            return client.table("chats").insert(payload_wo_tenant).execute()
+
+        res = await _async_retry(_call_wo_tenant, name="insert_chat_message_without_tenant", retries=1, fallback=lambda: None)
+
+    if res is None:
+        logger.error("❌ insert_chat_message failed uuid=%s", uuid)
+    else:
+        logger.info("insert_chat_message ok uuid=%s", uuid)
+
+
+# Backward-compatible alias (deprecated)
+upsert_chat = insert_chat_message
+
 # ------------------------------ Failure Status ------------------------------
 async def update_task_error(todo_id: str) -> None:
     """작업 실패 상태 업데이트 함수"""

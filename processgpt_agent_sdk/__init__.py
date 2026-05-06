@@ -1,9 +1,11 @@
 from .processgpt_agent_framework import (
     ProcessGPTAgentServer,
     ProcessGPTRequestContext,
-    ProcessGPTEventQueue,
+    ProcessEventQueue,
     ContextPreparationError,
 )
+from .event_queue_process import ProcessGPTEventQueue
+from .chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext
 from .database import (
     initialize_db,
     get_consumer_id,
@@ -29,6 +31,10 @@ __all__ = [
     "ProcessGPTAgentServer",
     "ProcessGPTRequestContext",
     "ProcessGPTEventQueue",
+    "ProcessEventQueue",
+    "ChatEventQueue",
+    "ChatRequest",
+    "ChatRequestContext",
     "ContextPreparationError",
     "initialize_db",
     "get_consumer_id",

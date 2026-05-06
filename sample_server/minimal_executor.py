@@ -3,8 +3,11 @@ import json
 from typing_extensions import override
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.types import TaskStatusUpdateEvent, TaskState, TaskArtifactUpdateEvent
-from a2a.utils import new_agent_text_message, new_text_artifact
+from a2a.helpers import new_task, new_text_artifact_update_event, new_text_status_update_event
+from a2a.helpers import new_text_message
+from a2a.types import Role, TaskState
+
+from processgpt_agent_sdk.chat_mode import ChatRequestContext
 
 
 class MinimalExecutor(AgentExecutor):
@@ -12,6 +15,25 @@ class MinimalExecutor(AgentExecutor):
 
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # 채팅 모드: Message-only (정확히 1개의 Message만 enqueue)
+        if isinstance(context, ChatRequestContext):
+            text = f"[chat] {context.get_user_input()}"
+            msg = new_text_message(text=text, role=Role.ROLE_AGENT)
+            # 방법 A: chats.messages에 저장할 payload를 execute()에서 직접 구성
+            msg.metadata.update(
+                {
+                    "chat_payload": {
+                        "role": "assistant",
+                        "content": text,
+                        "conversation_id": context.req.conversation_id,
+                        "tenant_id": context.req.tenant_id,
+                        "user_uid": context.req.user_uid,
+                    }
+                }
+            )
+            await event_queue.enqueue_event(msg)
+            return
+
         query = context.get_user_input()
         print(f"query: {query}")
 
@@ -23,8 +45,15 @@ class MinimalExecutor(AgentExecutor):
         # print("🧪 테스트용 강제 오류 발생!")
         # raise RuntimeError("MinimalExecutor에서 발생한 테스트용 오류")
 
+        # v1.0 스트리밍 규칙(태스크 라이프사이클): Task를 반드시 첫 이벤트로 enqueue
+        task = new_task(
+            task_id=str(task_id),
+            context_id=str(context_id),
+            state=TaskState.TASK_STATE_SUBMITTED,
+        )
+        await event_queue.enqueue_event(task)
+
         # 1) 진행 상태 이벤트 (events 저장, data=문자열)
-        # 결과 본문(JSON)을 그대로 보내되, Message 스키마 요구로 문자열로 직렬화
         payload = {
             "order_process_activity_order_request_form": {
                 "orderer_name": "안치윤",
@@ -32,69 +61,51 @@ class MinimalExecutor(AgentExecutor):
                 "order_quantity": "50",
             }
         }
-        # A2A Message 유틸을 사용해 표준 스키마 메시지 생성
-        event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                status={
-                    "state": TaskState.working,
-                    "message": new_agent_text_message(
-                        json.dumps(payload, ensure_ascii=False),
-                        context_id,
-                        task_id,
-                    ),
-                },
-                final=False,
-                contextId=context_id,
-                taskId=task_id,
-                metadata={
-                    "crew_type": "action",
-                    "event_type": "task_started",
-                    "job_id": "job-demo-0001",
-                },
-            )
+        status_evt = new_text_status_update_event(
+            task_id=str(task_id),
+            context_id=str(context_id),
+            state=TaskState.TASK_STATE_WORKING,
+            text=json.dumps(payload, ensure_ascii=False),
         )
+        status_evt.metadata.update(
+            {
+                "crew_type": "action",
+                "event_type": "task_started",
+                "job_id": "job-demo-0001",
+            }
+        )
+        await event_queue.enqueue_event(status_evt)
 
         await asyncio.sleep(0.1)
 
         # 1-2) 휴먼 인더 루프: 사용자 입력 요청 이벤트 (events 저장, event_type=human_asked)
         question_text = json.dumps(payload, ensure_ascii=False)
-        event_queue.enqueue_event(
-            TaskStatusUpdateEvent(
-                status={
-                    "state": TaskState.input_required,
-                    "message": new_agent_text_message(
-                        question_text,
-                        context_id,
-                        task_id,
-                    ),
-                },
-                final=True,
-                contextId=context_id,
-                taskId=task_id,
-                metadata={
-                    "crew_type": "action",
-                    "job_id": "job-demo-0001"
-                },
-            )
+        hil_evt = new_text_status_update_event(
+            task_id=str(task_id),
+            context_id=str(context_id),
+            state=TaskState.TASK_STATE_INPUT_REQUIRED,
+            text=question_text,
         )
+        hil_evt.metadata.update(
+            {
+                "crew_type": "action",
+                "job_id": "job-demo-0001",
+            }
+        )
+        await event_queue.enqueue_event(hil_evt)
 
         await asyncio.sleep(0.1)
 
         # 2) 최종 아티팩트 이벤트 (todolist 저장, p_final=True)
-        # 유틸을 사용해 표준 아티팩트 생성
-        artifact = new_text_artifact(
+        artifact_evt = new_text_artifact_update_event(
+            task_id=str(task_id),
+            context_id=str(context_id),
             name="current_result",
-            description="Result of request to agent.",
             text=json.dumps(payload, ensure_ascii=False),
+            last_chunk=True,
         )
-        event_queue.enqueue_event(
-            TaskArtifactUpdateEvent(
-                artifact=artifact,
-                lastChunk=True,
-                contextId=context_id,
-                taskId=task_id,
-            )
-        )
+        artifact_evt.artifact.description = "Result of request to agent."
+        await event_queue.enqueue_event(artifact_evt)
 
     @override
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
