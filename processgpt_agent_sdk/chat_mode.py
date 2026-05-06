@@ -41,7 +41,7 @@ class ChatRequest:
 class ChatRequestContext(RequestContext):
     """채팅 모드용 경량 RequestContext."""
 
-    def __init__(self, req: ChatRequest):
+    def __init__(self, req: ChatRequest, *, streamer: Optional["ChatStreamer"] = None):
         self.req = req
         self._user_input = (req.message or "").strip()
         self._message = self._user_input
@@ -63,6 +63,8 @@ class ChatRequestContext(RequestContext):
             "files": req.files,
             "file_count": req.file_count,
             "metadata": req.metadata,
+            # 채팅(SSE) 청크 스트리밍용(방법 A)
+            "streamer": streamer,
         }
 
     def get_user_input(self) -> str:
@@ -119,6 +121,23 @@ class ChatEventQueue(EventQueue):
         )
 
 
+class ChatStreamer:
+    """채팅(SSE) 청크를 enqueue_event와 분리해 흘려보내는 스트리머.
+
+    - A2A Message-only 규칙을 지키기 위해, 토큰/중간 청크는 enqueue_event(Message)로 보내지 않습니다.
+    - Executor는 `context.get_context_data()['extras']['streamer']`로 접근해 `await streamer.send_text(...)`를 호출합니다.
+    """
+
+    def __init__(self, out_queue: "asyncio.Queue[Dict[str, Any]]"):
+        self._out_queue = out_queue
+
+    async def send_text(self, text: str) -> None:
+        await self._out_queue.put({"type": "chunk", "text": text})
+
+    async def send_json(self, data: Any) -> None:
+        await self._out_queue.put({"type": "chunk_json", "data": data})
+
+
 async def default_chat_message_builder(req: ChatRequest, message: Message, response_text: str) -> Any:
     """기본 messages payload (외부 서비스에서 자유롭게 교체 가능)."""
     # 방법 A: execute()에서 message.metadata["chat_payload"]를 구성해 넣으면 그걸 그대로 저장
@@ -172,6 +191,12 @@ async def drain_sse_queue(q: "asyncio.Queue[Dict[str, Any]]") -> AsyncIterator[b
         if item.get("type") == "error":
             yield _sse_format("error", json.dumps(item.get("data"), ensure_ascii=False)).encode("utf-8")
             return
+        if item.get("type") == "chunk":
+            yield _sse_format("chunk", item.get("text") or "").encode("utf-8")
+            continue
+        if item.get("type") == "chunk_json":
+            yield _sse_format("chunk", json.dumps(item.get("data"), ensure_ascii=False)).encode("utf-8")
+            continue
         if item.get("type") == "message":
             yield _sse_format("message", item.get("text") or "").encode("utf-8")
             continue

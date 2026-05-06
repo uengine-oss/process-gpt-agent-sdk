@@ -26,7 +26,7 @@ from .database import (
 )
 from .utils import summarize_error_to_user, summarize_feedback, set_agent_model
 from .event_queue_process import ProcessEventQueue, ProcessGPTEventQueue
-from .chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext, drain_sse_queue, persist_chat_to_db
+from .chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext, ChatStreamer, drain_sse_queue, persist_chat_to_db
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -400,7 +400,8 @@ class ProcessGPTAgentServer:
             )
 
             out_q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
-            ctx = ChatRequestContext(req)
+            streamer = ChatStreamer(out_q) if req.stream else None
+            ctx = ChatRequestContext(req, streamer=streamer)
             q = ChatEventQueue(out_q, request=req, persist=persist_chat_to_db)
 
             async def _run_executor():

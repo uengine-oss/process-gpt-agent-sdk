@@ -17,6 +17,14 @@ class MinimalExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         # 채팅 모드: Message-only (정확히 1개의 Message만 enqueue)
         if isinstance(context, ChatRequestContext):
+            # 중간 스트리밍(청크)은 extras.streamer로 SSE에 흘림 (enqueue_event 아님)
+            streamer = (context.get_context_data().get("extras") or {}).get("streamer")
+            if streamer is not None:
+                await streamer.send_text("thinking...\n")
+                await asyncio.sleep(0.05)
+                await streamer.send_text("almost done...\n")
+                await asyncio.sleep(0.05)
+
             text = f"[chat] {context.get_user_input()}"
             msg = new_text_message(text=text, role=Role.ROLE_AGENT)
             # 방법 A: chats.messages에 저장할 payload를 execute()에서 직접 구성

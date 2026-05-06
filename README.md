@@ -130,6 +130,14 @@ from processgpt_agent_sdk.chat_mode import ChatRequestContext
 
 class MyExecutor(...):
     async def execute(self, context, event_queue):
+        # (선택) 중간 응답을 SSE로 스트리밍하고 싶다면,
+        # context.extras.streamer로 청크를 계속 흘릴 수 있습니다.
+        # - 이 청크들은 A2A Message-only 규칙과 무관하게 SSE로만 전송됩니다.
+        # - 최종 저장은 아래 enqueue_event(Message) 한 번으로 이뤄집니다.
+        streamer = (context.get_context_data().get("extras") or {}).get("streamer")
+        if streamer is not None:
+            await streamer.send_text("thinking...\\n")
+
         # 채팅(SSE) 요청이면 Message-only로 응답하고,
         # Message.metadata.chat_payload를 chats.messages에 그대로 저장합니다.
         if isinstance(context, ChatRequestContext):
