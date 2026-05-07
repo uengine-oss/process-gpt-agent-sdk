@@ -7,11 +7,12 @@ from uuid import uuid4
 from a2a.helpers import get_message_text
 from a2a.server.agent_execution import RequestContext
 from a2a.server.events import EventQueue, Event
-from a2a.types import Message
+from a2a.types import Message, TaskStatusUpdateEvent
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtobufMessage
 
 from .database import insert_chat_message
+from .context_api import REQUEST_KIND_CHAT
 
 
 @dataclass
@@ -43,6 +44,9 @@ class ChatRequestContext(RequestContext):
 
     def __init__(self, req: ChatRequest, *, streamer: Optional["ChatStreamer"] = None):
         self.req = req
+        # A2A 표준 식별자: 없으면 내부적으로 생성
+        self._context_id = str(req.conversation_id or uuid4().hex)
+        self._task_id = self._context_id
         self._user_input = (req.message or "").strip()
         self._message = self._user_input
         self._current_task = None
@@ -54,6 +58,8 @@ class ChatRequestContext(RequestContext):
             "user_id": req.user_uid,
         }
         self._extras: Dict[str, Any] = {
+            # Framework-level contract: request kind + optional streamer
+            "request_kind": REQUEST_KIND_CHAT,
             "tenant_id": req.tenant_id,
             "user_uid": req.user_uid,
             "user_email": req.user_email,
@@ -85,6 +91,28 @@ class ChatRequestContext(RequestContext):
     def get_context_data(self) -> Dict[str, Any]:
         return {"row": self._row, "extras": self._extras}
 
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        """A2A 표준 metadata 접근자.
+
+        샘플 Executor가 프레임워크 타입에 의존하지 않고 `context.metadata`만으로
+        채팅/프로세스 분기 및 저장 payload 구성을 할 수 있게 합니다.
+        """
+        return dict(self.req.metadata or {}) | {
+            "request_kind": REQUEST_KIND_CHAT,
+            "conversation_id": self.req.conversation_id,
+            "tenant_id": self.req.tenant_id,
+            "user_uid": self.req.user_uid,
+        }
+
+    @property
+    def task_id(self) -> str:
+        return self._task_id
+
+    @property
+    def context_id(self) -> str:
+        return self._context_id
+
 
 class ChatEventQueue(EventQueue):
     """채팅 모드 전용 EventQueue (A2A v1.0 Message-only 강제)."""
@@ -104,12 +132,34 @@ class ChatEventQueue(EventQueue):
         self._persist = persist
 
     async def enqueue_event(self, event: Event):
+        # 선택지 B: Executor는 A2A 이벤트만 emit.
+        # - 중간 스트리밍(토큰/툴 시작/종료 등)은 TaskStatusUpdateEvent.metadata(Struct)에 JSON 객체를 담아 보냅니다.
+        # - 최종 응답은 Message 1회만 허용합니다.
+        if isinstance(event, TaskStatusUpdateEvent):
+            md = getattr(event, "metadata", None)
+            if isinstance(md, ProtobufMessage):
+                data = MessageToDict(md, preserving_proto_field_name=True)
+            elif md is None:
+                data = {}
+            else:
+                # struct가 아닐 수도 있으니 best-effort
+                data = dict(md) if isinstance(md, dict) else {"value": md}
+
+            await self._out_queue.put({"event": "message", "data": data})
+            return
+
         if isinstance(event, Message):
             if self._sent_message:
                 raise RuntimeError("ChatEventQueue: multiple Message events are not allowed (Message-only stream).")
             self._sent_message = True
             self._response_text = get_message_text(event)
-            await self._out_queue.put({"type": "message", "text": self._response_text})
+            # SSE contract: 최종 응답 + 세션 종료 신호는 하나의 done으로 보냅니다.
+            await self._out_queue.put(
+                {
+                    "event": "message",
+                    "data": {"type": "done", "content": self._response_text},
+                }
+            )
             # 요구사항: 채팅 모드에서는 enqueue_event(Message)가 chats 테이블 기록 트리거
             if self._persist is not None:
                 await self._persist(self._request, event, self._response_text)
@@ -125,17 +175,19 @@ class ChatStreamer:
     """채팅(SSE) 청크를 enqueue_event와 분리해 흘려보내는 스트리머.
 
     - A2A Message-only 규칙을 지키기 위해, 토큰/중간 청크는 enqueue_event(Message)로 보내지 않습니다.
-    - Executor는 `context.get_context_data()['extras']['streamer']`로 접근해 `await streamer.send_text(...)`를 호출합니다.
+    - Executor는 `processgpt_agent_sdk.context_api.emit_chunk_text()` 같은 프레임워크 API를 통해 청크를 보냅니다.
     """
 
     def __init__(self, out_queue: "asyncio.Queue[Dict[str, Any]]"):
         self._out_queue = out_queue
 
     async def send_text(self, text: str) -> None:
-        await self._out_queue.put({"type": "chunk", "text": text})
+        # SSE contract: event=message, token chunks are messages
+        await self._out_queue.put({"event": "message", "data": {"type": "token", "content": text}})
 
     async def send_json(self, data: Any) -> None:
-        await self._out_queue.put({"type": "chunk_json", "data": data})
+        # JSON chunks are also messages
+        await self._out_queue.put({"event": "message", "data": data})
 
 
 async def default_chat_message_builder(req: ChatRequest, message: Message, response_text: str) -> Any:
@@ -185,20 +237,30 @@ def _sse_format(event: str, data: str) -> str:
 async def drain_sse_queue(q: "asyncio.Queue[Dict[str, Any]]") -> AsyncIterator[bytes]:
     while True:
         item = await q.get()
+        # New contract: only 'metadata' or 'message', with JSON object data
+        if item.get("event") in ("metadata", "message"):
+            yield _sse_format(item["event"], json.dumps(item.get("data") or {}, ensure_ascii=False)).encode("utf-8")
+            # done/error are expressed as message data types
+            if item.get("event") == "message" and isinstance(item.get("data"), dict) and item["data"].get("type") in ("done", "error"):
+                return
+            continue
+
+        # Backward-compat: accept legacy queue items (type-based)
         if item.get("type") == "done":
-            yield _sse_format("done", "").encode("utf-8")
+            yield _sse_format("message", json.dumps({"type": "done"}, ensure_ascii=False)).encode("utf-8")
             return
         if item.get("type") == "error":
-            yield _sse_format("error", json.dumps(item.get("data"), ensure_ascii=False)).encode("utf-8")
+            yield _sse_format("message", json.dumps({"type": "error", **(item.get("data") or {})}, ensure_ascii=False)).encode("utf-8")
             return
         if item.get("type") == "chunk":
-            yield _sse_format("chunk", item.get("text") or "").encode("utf-8")
+            yield _sse_format("message", json.dumps({"type": "token", "content": item.get("text") or ""}, ensure_ascii=False)).encode("utf-8")
             continue
         if item.get("type") == "chunk_json":
-            yield _sse_format("chunk", json.dumps(item.get("data"), ensure_ascii=False)).encode("utf-8")
+            yield _sse_format("message", json.dumps(item.get("data") or {}, ensure_ascii=False)).encode("utf-8")
             continue
         if item.get("type") == "message":
-            yield _sse_format("message", item.get("text") or "").encode("utf-8")
+            yield _sse_format("message", json.dumps({"type": "final", "content": item.get("text") or ""}, ensure_ascii=False)).encode("utf-8")
             continue
-        yield _sse_format("warning", json.dumps(item, ensure_ascii=False)).encode("utf-8")
+
+        yield _sse_format("message", json.dumps({"type": "warning", "data": item}, ensure_ascii=False)).encode("utf-8")
 

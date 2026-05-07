@@ -6,6 +6,7 @@ from .processgpt_agent_framework import (
 )
 from .event_queue_process import ProcessGPTEventQueue
 from .chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext
+from .context_api import emit_chunk_json, emit_chunk_text, get_request_kind, get_streamer, is_chat_request
 from .database import (
     initialize_db,
     get_consumer_id,
@@ -35,6 +36,11 @@ __all__ = [
     "ChatEventQueue",
     "ChatRequest",
     "ChatRequestContext",
+    "get_request_kind",
+    "get_streamer",
+    "is_chat_request",
+    "emit_chunk_text",
+    "emit_chunk_json",
     "ContextPreparationError",
     "initialize_db",
     "get_consumer_id",

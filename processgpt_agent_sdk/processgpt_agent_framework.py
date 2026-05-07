@@ -27,6 +27,7 @@ from .database import (
 from .utils import summarize_error_to_user, summarize_feedback, set_agent_model
 from .event_queue_process import ProcessEventQueue, ProcessGPTEventQueue
 from .chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext, ChatStreamer, drain_sse_queue, persist_chat_to_db
+from .context_api import REQUEST_KIND_PROCESS
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +51,8 @@ class TodoListRowContext:
 class ProcessGPTRequestContext(RequestContext):
     def __init__(self, row: Dict[str, Any]):
         self.row = row
+        self._task_id = str(row.get("id") or "")
+        self._context_id = str(row.get("root_proc_inst_id") or row.get("proc_inst_id") or "")
         self._user_input = (row.get("query") or "").strip()
         self._message = self._user_input
         self._current_task = None
@@ -210,7 +213,26 @@ class ProcessGPTRequestContext(RequestContext):
         return self._task_state
 
     def get_context_data(self) -> Dict[str, Any]:
-        return {"row": self.row, "extras": self._extra_context}
+        extras = dict(self._extra_context or {})
+        extras.setdefault("request_kind", REQUEST_KIND_PROCESS)
+        return {"row": self.row, "extras": extras}
+
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        """A2A 표준 metadata 접근자."""
+        md = dict(self._extra_context or {})
+        md.setdefault("request_kind", REQUEST_KIND_PROCESS)
+        # 최소 호환: 외부 Executor가 필요하면 row도 참조 가능
+        md.setdefault("row", self.row)
+        return md
+
+    @property
+    def task_id(self) -> str:
+        return self._task_id
+
+    @property
+    def context_id(self) -> str:
+        return self._context_id
 
 # ------------------------------ Agent Server ------------------------------
 class ProcessGPTAgentServer:
@@ -404,12 +426,23 @@ class ProcessGPTAgentServer:
             ctx = ChatRequestContext(req, streamer=streamer)
             q = ChatEventQueue(out_q, request=req, persist=persist_chat_to_db)
 
+            # SSE contract: send initial metadata event
+            await out_q.put({"event": "metadata", "data": {"conversation_id": ctx.context_id}})
+
             async def _run_executor():
                 try:
                     await self.agent_executor.execute(ctx, q)
-                    await out_q.put({"type": "done"})
+                    # 성공 종료는 Executor가 최종 Message를 enqueue하면(→ done/content) 그걸로 충분합니다.
+                    # 최종 Message를 보내지 않는 Executor도 있을 수 있어, 그 경우에만 빈 done을 보냅니다.
+                    if not getattr(q, "_sent_message", False):
+                        await out_q.put({"event": "message", "data": {"type": "done"}})
                 except Exception as ex:
-                    await out_q.put({"type": "error", "data": {"error": f"{type(ex).__name__}: {str(ex)}"}})
+                    await out_q.put(
+                        {
+                            "event": "message",
+                            "data": {"type": "error", "error": f"{type(ex).__name__}: {str(ex)}"},
+                        }
+                    )
 
             asyncio.create_task(_run_executor())
             return StreamingResponse(drain_sse_queue(out_q), media_type="text/event-stream")

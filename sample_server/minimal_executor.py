@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from typing_extensions import override
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -7,35 +8,82 @@ from a2a.helpers import new_task, new_text_artifact_update_event, new_text_statu
 from a2a.helpers import new_text_message
 from a2a.types import Role, TaskState
 
-from processgpt_agent_sdk.chat_mode import ChatRequestContext
+import litellm
 
 
 class MinimalExecutor(AgentExecutor):
     """A2A 규격 2종 이벤트만 전송하는 최소 예시 익스큐터."""
 
+    def _openai_api_base_from_proxy_url(self, proxy_url: str) -> str:
+        base = (proxy_url or "").rstrip("/")
+        return base if base.endswith("/v1") else f"{base}/v1"
+
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        # 채팅 모드: Message-only (정확히 1개의 Message만 enqueue)
-        if isinstance(context, ChatRequestContext):
-            # 중간 스트리밍(청크)은 extras.streamer로 SSE에 흘림 (enqueue_event 아님)
-            streamer = (context.get_context_data().get("extras") or {}).get("streamer")
-            if streamer is not None:
-                await streamer.send_text("thinking...\n")
-                await asyncio.sleep(0.05)
-                await streamer.send_text("almost done...\n")
-                await asyncio.sleep(0.05)
+        # 채팅 모드: Message-only
+        # - 프레임워크/전송(SSE) 세부에는 의존하지 않고, A2A 표준 metadata로만 분기합니다.
+        if (context.metadata or {}).get("request_kind") == "chat":
+            # LLM 프록시 스트리밍 예시 (LiteLLM / OpenAI 호환)
+            # - env: LLM_MODEL, LLM_PROXY_URL, LLM_PROXY_API_KEY
+            # - 토큰 스트림은 A2A TaskStatusUpdateEvent.metadata(JSON)로 emit → SSE event: message로 변환됨
+            model = os.environ.get("LLM_MODEL")
+            proxy_url = os.environ.get("LLM_PROXY_URL")
+            api_key = os.environ.get("LLM_PROXY_API_KEY")
+            if not model or not proxy_url or not api_key:
+                raise RuntimeError("LLM 스트리밍 예제 실행을 위해 LLM_MODEL/LLM_PROXY_URL/LLM_PROXY_API_KEY가 필요합니다.")
 
-            text = f"[chat] {context.get_user_input()}"
-            msg = new_text_message(text=text, role=Role.ROLE_AGENT)
-            # 방법 A: chats.messages에 저장할 payload를 execute()에서 직접 구성
+            ctx_id = context.context_id or "ctx-unknown"
+            task_id = context.task_id or "task-unknown"
+
+            user_text = context.get_user_input()
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant. Reply in Korean."},
+                {"role": "user", "content": user_text},
+            ]
+
+            stream = await litellm.acompletion(
+                model=model,
+                messages=messages,
+                temperature=0,
+                stream=True,
+                api_base=self._openai_api_base_from_proxy_url(proxy_url),
+                api_key=api_key,
+            )
+
+            full = ""
+            async for chunk in stream:
+                try:
+                    # OpenAI-stream-like: choices[0].delta.content
+                    delta = chunk.choices[0].delta  # type: ignore[attr-defined]
+                    token = getattr(delta, "content", None)
+                    if not token:
+                        continue
+                except Exception:
+                    continue
+
+                full += token
+                tok_evt = new_text_status_update_event(
+                    task_id=str(task_id),
+                    context_id=str(ctx_id),
+                    state=TaskState.TASK_STATE_WORKING,
+                    text="",
+                )
+                tok_evt.metadata.update({"type": "token", "content": token})
+                await event_queue.enqueue_event(tok_evt)
+
+            msg = new_text_message(text=full, role=Role.ROLE_AGENT)
+            # (선택) 외부 서비스가 저장을 원하면, message.metadata에 payload를 실어 전송할 수 있습니다.
+            # 여기서는 A2A 표준 context_id / tenant(있으면) / metadata만 사용해 예시로 구성합니다.
+            md = context.metadata or {}
             msg.metadata.update(
                 {
                     "chat_payload": {
                         "role": "assistant",
-                        "content": text,
-                        "conversation_id": context.req.conversation_id,
-                        "tenant_id": context.req.tenant_id,
-                        "user_uid": context.req.user_uid,
+                        "content": full,
+                        "context_id": context.context_id,
+                        "task_id": context.task_id,
+                        "tenant": getattr(context, "tenant", None),
+                        "request_metadata": md,
                     }
                 }
             )
@@ -45,9 +93,10 @@ class MinimalExecutor(AgentExecutor):
         query = context.get_user_input()
         print(f"query: {query}")
 
-        row = context.get_context_data()["row"]
-        context_id = row.get("root_proc_inst_id") or row.get("proc_inst_id")
-        task_id = row.get("id")
+        # 프로세스(폴링) 모드: Task lifecycle 패턴 (Task → status/artifact)
+        # - A2A 표준 task_id/context_id를 사용합니다.
+        context_id = context.context_id or "ctx-unknown"
+        task_id = context.task_id or "task-unknown"
         
         # # 🧪 테스트용 강제 오류 발생
         # print("🧪 테스트용 강제 오류 발생!")

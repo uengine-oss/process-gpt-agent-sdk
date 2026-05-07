@@ -123,35 +123,70 @@ if __name__ == "__main__":
 ### 4.2 Executor 구현 예시 (채팅 저장 payload 커스텀)
 
 ```python
+import os
+
 from a2a.helpers import new_text_message
+from a2a.helpers import new_text_status_update_event
 from a2a.types import Role
-from processgpt_agent_sdk.chat_mode import ChatRequestContext
+from a2a.types import TaskState
+import litellm
 
 
 class MyExecutor(...):
     async def execute(self, context, event_queue):
-        # (선택) 중간 응답을 SSE로 스트리밍하고 싶다면,
-        # context.extras.streamer로 청크를 계속 흘릴 수 있습니다.
-        # - 이 청크들은 A2A Message-only 규칙과 무관하게 SSE로만 전송됩니다.
-        # - 최종 저장은 아래 enqueue_event(Message) 한 번으로 이뤄집니다.
-        streamer = (context.get_context_data().get("extras") or {}).get("streamer")
-        if streamer is not None:
-            await streamer.send_text("thinking...\\n")
+        # (선택) 중간 스트리밍(토큰/툴 이벤트)을 SSE로 흘리고 싶다면,
+        # A2A 표준 `TaskStatusUpdateEvent.metadata`에 "JSON 객체"를 담아 enqueue 하세요.
+        # 프레임워크가 이를 SSE `event: message`의 `data`로 변환해 발행합니다.
+        #
+        # 예: LiteLLM 프록시(OpenAI 호환) 스트리밍 → token 이벤트로 변환
+        model = os.environ.get("LLM_MODEL")
+        proxy_url = (os.environ.get("LLM_PROXY_URL") or "").rstrip("/")
+        api_key = os.environ.get("LLM_PROXY_API_KEY")
+        api_base = proxy_url if proxy_url.endswith("/v1") else f"{proxy_url}/v1"
 
         # 채팅(SSE) 요청이면 Message-only로 응답하고,
         # Message.metadata.chat_payload를 chats.messages에 그대로 저장합니다.
-        if isinstance(context, ChatRequestContext):
-            text = f"[chat] {context.get_user_input()}"
-            msg = new_text_message(text=text, role=Role.ROLE_AGENT)
+        if (context.metadata or {}).get("request_kind") == "chat":
+            stream = await litellm.acompletion(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant. Reply in Korean."},
+                    {"role": "user", "content": context.get_user_input()},
+                ],
+                temperature=0,
+                stream=True,
+                api_base=api_base,
+                api_key=api_key,
+            )
+
+            full = ""
+            async for chunk in stream:
+                try:
+                    token = chunk.choices[0].delta.content
+                except Exception:
+                    token = None
+                if not token:
+                    continue
+
+                full += token
+                tok_evt = new_text_status_update_event(
+                    task_id=context.task_id,
+                    context_id=context.context_id,
+                    state=TaskState.TASK_STATE_WORKING,
+                    text="",
+                )
+                tok_evt.metadata.update({"type": "token", "content": token})
+                await event_queue.enqueue_event(tok_evt)
+
+            msg = new_text_message(text=full, role=Role.ROLE_AGENT)
             msg.metadata.update(
                 {
                     "chat_payload": {
                         # 이 payload는 외부 서비스가 원하는 형태로 자유롭게 구성하세요.
                         "role": "assistant",
-                        "content": text,
-                        "conversation_id": context.req.conversation_id,
-                        "tenant_id": context.req.tenant_id,
-                        "user_uid": context.req.user_uid,
+                        "content": full,
+                        # (선택) conversation_id/tenant_id/user_uid 등은
+                        # 외부 서비스가 표준 필드로 실어 보내거나, 별도 저장 로직에서 주입하세요.
                     }
                 }
             )

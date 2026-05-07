@@ -2,7 +2,9 @@ import asyncio
 import unittest
 
 from a2a.helpers import new_text_message
+from a2a.helpers import new_text_status_update_event
 from a2a.types import Role
+from a2a.types import TaskState
 
 from processgpt_agent_sdk.chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext, ChatStreamer
 
@@ -16,8 +18,9 @@ class TestChatEventQueue(unittest.IsolatedAsyncioTestCase):
         await q.enqueue_event(msg)
 
         item = await out_q.get()
-        self.assertEqual(item["type"], "message")
-        self.assertEqual(item["text"], "hello")
+        self.assertEqual(item["event"], "message")
+        self.assertEqual(item["data"]["type"], "done")
+        self.assertEqual(item["data"]["content"], "hello")
 
     async def test_rejects_multiple_messages(self):
         out_q: asyncio.Queue[dict] = asyncio.Queue()
@@ -29,6 +32,24 @@ class TestChatEventQueue(unittest.IsolatedAsyncioTestCase):
         await q.enqueue_event(msg1)
         with self.assertRaises(RuntimeError):
             await q.enqueue_event(msg2)
+
+    async def test_accepts_status_update_metadata_as_message_data(self):
+        out_q: asyncio.Queue[dict] = asyncio.Queue()
+        q = ChatEventQueue(out_q, request=ChatRequest(message="user"))
+
+        evt = new_text_status_update_event(
+            task_id="t1",
+            context_id="c1",
+            state=TaskState.TASK_STATE_WORKING,
+            text="",
+        )
+        evt.metadata.update({"type": "token", "content": "우리"})
+        await q.enqueue_event(evt)
+
+        item = await out_q.get()
+        self.assertEqual(item["event"], "message")
+        self.assertEqual(item["data"]["type"], "token")
+        self.assertEqual(item["data"]["content"], "우리")
 
     async def test_message_calls_persist(self):
         out_q: asyncio.Queue[dict] = asyncio.Queue()
@@ -60,8 +81,14 @@ class TestChatEventQueue(unittest.IsolatedAsyncioTestCase):
         await streamer.send_text("a")
         await streamer.send_json({"b": 1})
 
-        self.assertEqual((await out_q.get())["type"], "chunk")
-        self.assertEqual((await out_q.get())["type"], "chunk_json")
+        item1 = await out_q.get()
+        self.assertEqual(item1["event"], "message")
+        self.assertEqual(item1["data"]["type"], "token")
+        self.assertEqual(item1["data"]["content"], "a")
+
+        item2 = await out_q.get()
+        self.assertEqual(item2["event"], "message")
+        self.assertEqual(item2["data"], {"b": 1})
 
 
 if __name__ == "__main__":
