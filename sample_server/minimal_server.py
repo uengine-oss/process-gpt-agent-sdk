@@ -12,11 +12,10 @@ from sample_server.minimal_executor import MinimalExecutor
 async def main():
     load_dotenv()
     server = ProcessGPTAgentServer(
-        agent_executor=MinimalExecutor(),          # executor 내부에서 chat/process 분기
-        agent_type=os.getenv("PROCESS_AGENT_TYPE", "langchain-react"),
+        agent_executor=MinimalExecutor(),
+        agent_type="langchain-react",
     )
 
-    # 채팅 SSE 서버 설정
     try:
         from starlette.applications import Starlette  # type: ignore[reportMissingImports]
         import uvicorn  # type: ignore[reportMissingImports]
@@ -28,14 +27,8 @@ async def main():
         ) from e
 
     app = Starlette()
-    server.mount_chat_sse(app, path=os.getenv("CHAT_SSE_PATH", "/chat/stream"))
-
-    # 기본 포트는 로컬에서 충돌이 잦아 8010을 사용
-    host = os.getenv("CHAT_HOST", "127.0.0.1")
-    port = int(os.getenv("CHAT_PORT", "8010"))
-    uvicorn_server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
-
-    # 프로세스 모드(폴링) + 채팅 모드(SSE) 동시 실행
+    server.mount_chat_sse(app, path="/chat/stream")
+    uvicorn_server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8010, log_level="info"))
     await asyncio.gather(server.run(), uvicorn_server.serve())
 
 

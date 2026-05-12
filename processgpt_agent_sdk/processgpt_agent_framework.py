@@ -406,13 +406,25 @@ class ProcessGPTAgentServer:
             except Exception:
                 body = {}
 
+            # 본문에 user_jwt가 없을 때 Authorization: Bearer … 를 채팅 extras/도구까지 전달하기 위해 사용
+            auth_jwt = ""
+            try:
+                auth_hdr = (request.headers.get("authorization") or "").strip()
+                if auth_hdr.lower().startswith("bearer "):
+                    auth_jwt = auth_hdr[7:].strip()
+            except Exception:
+                auth_jwt = ""
+
+            body_jwt = str(body.get("user_jwt") or "")
+            user_jwt = body_jwt or auth_jwt
+
             req = ChatRequest(
                 message=str(body.get("message") or body.get("text") or ""),
                 tenant_id=str(body.get("tenant_id") or ""),
                 user_uid=str(body.get("user_uid") or body.get("user_id") or ""),
                 user_email=str(body.get("user_email") or ""),
                 user_name=str(body.get("user_name") or ""),
-                user_jwt=str(body.get("user_jwt") or ""),
+                user_jwt=user_jwt,
                 conversation_id=body.get("conversation_id"),
                 file=body.get("file") if isinstance(body.get("file"), dict) else None,
                 files=list(body.get("files") or []) if isinstance(body.get("files") or [], list) else [],
@@ -432,9 +444,9 @@ class ProcessGPTAgentServer:
             async def _run_executor():
                 try:
                     await self.agent_executor.execute(ctx, q)
-                    # 성공 종료는 Executor가 최종 Message를 enqueue하면(→ done/content) 그걸로 충분합니다.
-                    # 최종 Message를 보내지 않는 Executor도 있을 수 있어, 그 경우에만 빈 done을 보냅니다.
-                    if not getattr(q, "_sent_message", False):
+                    # 성공 종료는 Executor가 TaskArtifactUpdateEvent(last_chunk=True)를 enqueue하면 SSE done이 자동 발행됩니다.
+                    # 최종 artifact를 emit하지 않는 Executor를 위해, 그 경우에만 빈 done을 보냅니다.
+                    if not getattr(q, "_finalized", False):
                         await out_q.put({"event": "message", "data": {"type": "done"}})
                 except Exception as ex:
                     await out_q.put(

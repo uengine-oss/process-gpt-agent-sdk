@@ -1,18 +1,24 @@
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, List
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, List, Union
 from uuid import uuid4
 
-from a2a.helpers import get_message_text
+from a2a.helpers import get_artifact_text, get_message_text
 from a2a.server.agent_execution import RequestContext
 from a2a.server.events import EventQueue, Event
-from a2a.types import Message, TaskStatusUpdateEvent
+from a2a.types import Message, Task, TaskArtifactUpdateEvent, TaskStatusUpdateEvent
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtobufMessage
 
 from .database import insert_chat_message
 from .context_api import REQUEST_KIND_CHAT
+
+
+# 채팅 모드에서 "최종 응답"으로 받아들이는 이벤트 타입.
+# - TaskArtifactUpdateEvent: 통일 경로(프로세스 라이프사이클과 동일)
+# - Message: 하위호환(Message-only 스트림)
+FinalEvent = Union[TaskArtifactUpdateEvent, Message]
 
 
 @dataclass
@@ -57,18 +63,28 @@ class ChatRequestContext(RequestContext):
             "tenant_id": req.tenant_id,
             "user_id": req.user_uid,
         }
-        self._extras: Dict[str, Any] = {
-            # Framework-level contract: request kind + optional streamer
-            "request_kind": REQUEST_KIND_CHAT,
+        # Executor/HTTP 채팅과 동일한 식별자 슬롯을 extras 최상위 + input_data 양쪽에 둔다.
+        # - 최상위: context_api / 커스텀 코드가 바로 읽기 좋음
+        # - input_data: [InputData] JSON 없는 SDK 채팅에서도 동일 키로 도구 보강(merge)이 동작하게 함
+        _idem = {
             "tenant_id": req.tenant_id,
             "user_uid": req.user_uid,
             "user_email": req.user_email,
-            "user_name": req.user_name,
             "user_jwt": req.user_jwt,
+            "user_name": req.user_name,
             "conversation_id": req.conversation_id,
+            "metadata": dict(req.metadata or {}),
+        }
+        notify: List[str] = []
+        if (req.user_email or "").strip():
+            notify.append(str(req.user_email).strip())
+        self._extras: Dict[str, Any] = {
+            "request_kind": REQUEST_KIND_CHAT,
+            **_idem,
+            "input_data": _idem,
             "files": req.files,
             "file_count": req.file_count,
-            "metadata": req.metadata,
+            "notify_user_emails": notify,
             # 채팅(SSE) 청크 스트리밍용(방법 A)
             "streamer": streamer,
         }
@@ -115,60 +131,92 @@ class ChatRequestContext(RequestContext):
 
 
 class ChatEventQueue(EventQueue):
-    """채팅 모드 전용 EventQueue (A2A v1.0 Message-only 강제)."""
+    """채팅 모드 전용 EventQueue.
+
+    A2A 표준 이벤트 타입을 라우팅 키로 사용합니다 (매직 metadata 없음).
+
+    - Task: 라이프사이클 마커. SSE에 노출 X.
+    - Message: 채팅용 청크. 토큰마다 1개씩 SSE message로 발행 (반복 허용).
+    - TaskStatusUpdateEvent: 프로세스 모드 전용 신호. 채팅에선 silently ignore.
+    - TaskArtifactUpdateEvent(last_chunk=True): 최종 결과. SSE done + chats 저장.
+    - TaskArtifactUpdateEvent(last_chunk=False): 정의상 사용 안 함. silently ignore.
+
+    필터링은 Executor 책임이고 SDK 는 받은 대로 라우팅합니다.
+    """
 
     def __init__(
         self,
         out_queue: "asyncio.Queue[Dict[str, Any]]",
         *,
         request: ChatRequest,
-        persist: Optional[Callable[[ChatRequest, Message, str], Awaitable[None]]] = None,
+        persist: Optional[Callable[[ChatRequest, FinalEvent, str], Awaitable[None]]] = None,
     ):
         super().__init__()
         self._out_queue = out_queue
-        self._sent_message = False
+        self._finalized = False
         self._response_text: str = ""
         self._request = request
         self._persist = persist
 
     async def enqueue_event(self, event: Event):
-        # 선택지 B: Executor는 A2A 이벤트만 emit.
-        # - 중간 스트리밍(토큰/툴 시작/종료 등)은 TaskStatusUpdateEvent.metadata(Struct)에 JSON 객체를 담아 보냅니다.
-        # - 최종 응답은 Message 1회만 허용합니다.
+        # 라이프사이클 마커: SSE 노출 안 함
+        if isinstance(event, Task):
+            return
+
+        # 프로세스 전용 이벤트: 채팅 큐는 무시
         if isinstance(event, TaskStatusUpdateEvent):
-            md = getattr(event, "metadata", None)
-            if isinstance(md, ProtobufMessage):
-                data = MessageToDict(md, preserving_proto_field_name=True)
-            elif md is None:
-                data = {}
-            else:
-                # struct가 아닐 수도 있으니 best-effort
-                data = dict(md) if isinstance(md, dict) else {"value": md}
-
-            await self._out_queue.put({"event": "message", "data": data})
             return
 
+        # 채팅 토큰 청크: 메시지 1개 = 토큰 1개 = SSE message 1개
         if isinstance(event, Message):
-            if self._sent_message:
-                raise RuntimeError("ChatEventQueue: multiple Message events are not allowed (Message-only stream).")
-            self._sent_message = True
-            self._response_text = get_message_text(event)
-            # SSE contract: 최종 응답 + 세션 종료 신호는 하나의 done으로 보냅니다.
+            text = get_message_text(event)
+            self._response_text += text
             await self._out_queue.put(
-                {
-                    "event": "message",
-                    "data": {"type": "done", "content": self._response_text},
-                }
+                {"event": "message", "data": {"type": "token", "content": text}}
             )
-            # 요구사항: 채팅 모드에서는 enqueue_event(Message)가 chats 테이블 기록 트리거
-            if self._persist is not None:
-                await self._persist(self._request, event, self._response_text)
             return
 
+        # 최종 결과 아티팩트
+        if isinstance(event, TaskArtifactUpdateEvent):
+            is_final = bool(
+                getattr(event, "last_chunk", None)
+                or getattr(event, "lastChunk", None)
+                or getattr(event, "final", None)
+            )
+            if not is_final:
+                # 본 모델에선 토큰 스트리밍에 Message를 쓰므로 중간 artifact는 의미가 없음.
+                # 만에 하나 들어와도 silent ignore (SDK는 dumb transport).
+                return
+
+            artifact = getattr(event, "artifact", None)
+            final_text = get_artifact_text(artifact) if artifact is not None else ""
+            await self._finalize(event, final_text)
+            return
+
+        # 그 외는 알 수 없는 이벤트 — 명시적 에러
         raise RuntimeError(
-            f"ChatEventQueue: unsupported event type in chat mode: {type(event).__name__}. "
-            "Chat mode requires Message-only stream."
+            f"ChatEventQueue: unsupported event type in chat mode: {type(event).__name__}."
         )
+
+    async def _finalize(self, event: FinalEvent, response_text: str) -> None:
+        if self._finalized:
+            raise RuntimeError(
+                "ChatEventQueue: multiple final artifacts are not allowed "
+                "(emit exactly one TaskArtifactUpdateEvent(last_chunk=True) per chat session)."
+            )
+        self._finalized = True
+        # 최종 텍스트는 누적된 토큰들이 아니라 artifact가 들고 온 풀 텍스트를 우선 사용
+        # (Executor가 artifact에 누적 텍스트를 실어 보내는 게 표준 패턴)
+        if response_text:
+            self._response_text = response_text
+        await self._out_queue.put(
+            {
+                "event": "message",
+                "data": {"type": "done", "content": self._response_text},
+            }
+        )
+        if self._persist is not None:
+            await self._persist(self._request, event, self._response_text)
 
 
 class ChatStreamer:
@@ -190,33 +238,36 @@ class ChatStreamer:
         await self._out_queue.put({"event": "message", "data": data})
 
 
-async def default_chat_message_builder(req: ChatRequest, message: Message, response_text: str) -> Any:
-    """기본 messages payload (외부 서비스에서 자유롭게 교체 가능)."""
-    # 방법 A: execute()에서 message.metadata["chat_payload"]를 구성해 넣으면 그걸 그대로 저장
-    metadata = getattr(message, "metadata", None)
-    if isinstance(metadata, ProtobufMessage):
-        md = MessageToDict(metadata, preserving_proto_field_name=True)
-        chat_payload = md.get("chat_payload")
-        if chat_payload is not None:
-            return chat_payload
+def _build_chat_message_payload(req: ChatRequest, response_text: str) -> Dict[str, Any]:
+    """chats.messages에 저장할 표준 payload를 구성합니다.
 
-    return {
+    Executor는 A2A 이벤트만 emit하면 되고, 저장 형식은 프레임워크가 결정합니다.
+    """
+    # 채팅 모드에서 assistant 메시지를 저장할 때, UI/백엔드에서 공통으로 기대하는 기본 actor 정보.
+    meta: Dict[str, Any] = dict(req.metadata or {})
+    assistant_defaults: Dict[str, Any] = {
+        "name": "Process GPT Agent",
         "role": "assistant",
+        "email": "agent:process-gpt-agent",
+        "agentId": "process-gpt-agent",
+        "profile": "/images/chat-icon.png",
+        "userName": "Process GPT Agent",
+    }
+    for k in list(assistant_defaults.keys()):
+        if k in meta:
+            assistant_defaults[k] = meta[k]
+
+    meta_rest = {k: v for k, v in meta.items() if k not in assistant_defaults}
+    return {
+        **assistant_defaults,
+        **meta_rest,
         "content": response_text,
-        "conversation_id": req.conversation_id,
-        "tenant_id": req.tenant_id,
-        "user": {
-            "uid": req.user_uid,
-            "email": req.user_email,
-            "name": req.user_name,
-        },
-        "metadata": req.metadata,
     }
 
 
-async def persist_chat_to_db(req: ChatRequest, message: Message, response_text: str) -> None:
+async def persist_chat_to_db(req: ChatRequest, event: FinalEvent, response_text: str) -> None:
     """chats 테이블에 '단일 메시지 row'를 저장합니다."""
-    payload = await default_chat_message_builder(req, message, response_text)
+    payload = _build_chat_message_payload(req, response_text)
     message_uuid = uuid4().hex
     chat_id = req.conversation_id or message_uuid
     await insert_chat_message(

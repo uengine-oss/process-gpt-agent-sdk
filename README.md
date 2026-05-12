@@ -64,15 +64,96 @@ flowchart TD
   - `Role.agent` → `Role.ROLE_AGENT`
   - (추가) `Role.ROLE_UNSPECIFIED`
 
-### Event Type (4가지)
-| Event Type | Python 클래스 | 저장 테이블 | 설명 |
-|------------|---------------|-------------|------|
-| **task_started** | `TaskStatusUpdateEvent` | `events` | 작업 시작 상태 |
-| **task_working** | `TaskStatusUpdateEvent` | `events` | 작업 진행 중 상태 |
-| **task_completed** | `TaskArtifactUpdateEvent` | `todolist` | 작업 완료 및 결과물 저장 |
-| **task_error** | `TaskStatusUpdateEvent` | `events` | 작업 오류 발생 |
+### `events.event_type` enum 매핑
 
-👉 **A2A 타입 2가지**가 핵심이며, 각각 `events`와 `todolist` 테이블에 매칭됩니다. **Event Type 4가지**로 세부 상태를 구분합니다.
+DB 의 `events.event_type` 컬럼은 enum 입니다. Executor 가 emit한 `TaskStatusUpdateEvent` 가 `events` 테이블에 저장될 때 어떤 enum 값으로 들어가는지는 다음과 같이 결정됩니다.
+
+| event_type (DB enum) | 발행 주체 | A2A 이벤트 형태 | 매핑 방식 |
+|---|---|---|---|
+| `task_started` | Executor | `TaskStatusUpdateEvent(state=SUBMITTED)` | **자동** (state 기반) |
+| `task_completed` | Executor | `TaskStatusUpdateEvent(state=COMPLETED)` | **자동** (state 기반) |
+| `error` | Executor | `TaskStatusUpdateEvent(state=FAILED)` | **자동** (state 기반) |
+| `human_asked` | Executor | `TaskStatusUpdateEvent(state=INPUT_REQUIRED)` | **자동** (state 기반) |
+| `task_working` | Executor | `TaskStatusUpdateEvent(state=WORKING)` + `metadata["event_type"]="task_working"` | 명시 |
+| `tool_usage_started` / `tool_usage_finished` | Executor | `TaskStatusUpdateEvent(state=WORKING)` + `metadata["event_type"]="tool_usage_*"` | 명시 (sub-event, 아래 참조) |
+| `crew_completed` | SDK | (Executor 가 emit X) | **자동** — `TaskArtifactUpdateEvent(last_chunk=True)` 처리 시점에 SDK 가 발행 (안전망: framework 의 `task_done()`) |
+
+> **자동 매핑 규칙**: SDK 는 다음 lifecycle state 를 자동으로 enum 값으로 매핑합니다.
+> - `TASK_STATE_SUBMITTED` → `task_started`
+> - `TASK_STATE_COMPLETED` → `task_completed`
+> - `TASK_STATE_FAILED` → `error`
+> - `TASK_STATE_INPUT_REQUIRED` → `human_asked`
+>
+> `TASK_STATE_WORKING` 은 의도적으로 자동 매핑 대상이 아닙니다. WORKING 은 너무 광범위하고 도메인 sub-event(`tool_usage_*` 등) 의 베이스로도 재사용되므로, sub-event 의미와 충돌하지 않도록 NULL 로 두거나 `metadata["event_type"]` 으로 명시하세요. metadata 가 없으면 `event_type` 컬럼은 NULL 로 저장됩니다(허용됨).
+>
+> **명시 vs 자동 우선순위**: `metadata["event_type"]` 가 있으면 자동 매핑보다 우선합니다 (explicit > implicit). 예: `state=WORKING + metadata["event_type"]="tool_usage_started"` → `tool_usage_started` 로 저장.
+>
+> **`task_completed` vs `TaskArtifactUpdateEvent`**: 둘은 별개입니다. `task_completed` 는 events 테이블의 lifecycle 표시이고, 실제 결과물 저장은 `TaskArtifactUpdateEvent(last_chunk=True)` 가 todolist 테이블에 수행합니다.
+
+### A2A 타입 = 라우팅 키 (SDK 는 dumb transport)
+
+**원칙**: Executor 는 A2A 표준 이벤트와 표준 필드만 emit. SDK 는 매직 메타데이터 없이 **A2A 이벤트 타입 자체를 라우팅 키로** 사용합니다. 필터링은 Executor 책임이고 SDK 는 받은 대로 라우팅합니다.
+
+**라우팅 매트릭스**:
+
+| A2A 이벤트 타입 | ChatEventQueue | ProcessEventQueue |
+|---|---|---|
+| `Task` (라이프사이클 마커) | silently ignore | silently ignore |
+| `Message` | SSE `{"type":"token","content":...}` (반복 허용 = 토큰 스트리밍) | silently ignore |
+| `TaskStatusUpdateEvent` | silently ignore | events 테이블 저장 (state/text 그대로) |
+| `TaskArtifactUpdateEvent(last_chunk=True)` | SSE `done` + chats 저장 | todolist 저장 (`is_final=True`) |
+
+**Executor 의 표준 흐름 (LLM 스트리밍 예시)**:
+1. `Task` (state=SUBMITTED) — 라이프사이클 시작
+2. 토큰마다:
+   - `Message(text=token)` — 채팅용
+   - `TaskStatusUpdateEvent(state=WORKING, text=token)` — 프로세스용 (필요 시 JSON payload)
+3. `TaskStatusUpdateEvent(state=COMPLETED, text=full)` — 종료 알림 (선택)
+4. `TaskArtifactUpdateEvent(last_chunk=True, text=full)` — 최종 결과
+
+> 부하 우려가 있다면 (예: events 테이블에 토큰 row 가 너무 많이 쌓일 경우) Executor 가 직접 필터링/집계하세요. SDK 는 정책을 강제하지 않습니다.
+
+### 도메인 sub-event 기록 (도구 호출 등)
+
+`tool_usage_started`, `tool_usage_finished` 같은 도메인 sub-event 는 A2A `TaskState` 에 직접 매핑되지 않습니다 — `TaskState` 는 작업 전체의 lifecycle (SUBMITTED → WORKING → COMPLETED/FAILED) 추상화이고, 도구 호출은 그 안에서 일어나는 세부 사건입니다.
+
+이런 sub-event 는 `state=TASK_STATE_WORKING` 그대로 두고, **`metadata["event_type"]`** 로 enum 값을 명시하세요. SDK 가 그 값을 `events.event_type` 컬럼에 그대로 기록합니다. `data` 컬럼에는 `text` 로 실은 JSON payload (도구 이름, 인자, 결과 등) 가 저장됩니다.
+
+```python
+import json
+from a2a.helpers import new_text_status_update_event
+from a2a.types import TaskState
+
+# 도구 호출 시작
+evt_start = new_text_status_update_event(
+    task_id=task_id, context_id=context_id,
+    state=TaskState.TASK_STATE_WORKING,
+    text=json.dumps(
+        {"tool": "web_search", "args": {"query": "process-gpt"}},
+        ensure_ascii=False,
+    ),
+)
+evt_start.metadata.update({"event_type": "tool_usage_started"})
+await event_queue.enqueue_event(evt_start)
+
+# ... 도구 실제 호출 ...
+
+# 도구 호출 종료
+evt_end = new_text_status_update_event(
+    task_id=task_id, context_id=context_id,
+    state=TaskState.TASK_STATE_WORKING,
+    text=json.dumps(
+        {"tool": "web_search", "result_summary": "...", "elapsed_ms": 312},
+        ensure_ascii=False,
+    ),
+)
+evt_end.metadata.update({"event_type": "tool_usage_finished"})
+await event_queue.enqueue_event(evt_end)
+```
+
+> **TaskState 는 lifecycle, metadata 는 도메인 분류**: A2A 표준 envelope 안에 머무르면서 도메인 이벤트도 enum 으로 정확히 기록할 수 있는 방식입니다. `metadata` 자체는 A2A `TaskStatusUpdateEvent` 의 표준 free-form 필드라 "A2A 표준만 사용" 원칙과 충돌하지 않습니다.
+> 
+> **빈도 주의**: tool_usage 는 trace 성격이라 LLM 한 번에 도구 5번 호출하면 events row 10개가 쌓입니다. 너무 빈번하면 Executor 측에서 sampling/aggregation 을 적용하거나, 결과만 한 번에 묶어 emit 하세요. `tool_usage_*` 는 **도구 호출 단위**에서만 emit하고, 토큰 스트리밍 루프 안에는 절대 넣지 마세요.
 
 ---
 
@@ -120,82 +201,107 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### 4.2 Executor 구현 예시 (채팅 저장 payload 커스텀)
+### 4.2 Executor 구현 예시 (A2A 표준만 사용)
+
+> **제 1원칙**: Executor 는 A2A 표준 이벤트만 emit. SDK 매직 메타데이터(`metadata.update({"type":"token",...})` 같은) 일절 사용 금지. **A2A 이벤트 타입 자체가 라우팅 키.**
+
+이벤트 흐름:
+1. `Task(state=SUBMITTED)` — 라이프사이클 시작
+2. 토큰마다:
+   - `Message(text=token)` — 채팅(SSE) 토큰 청크. ChatEventQueue 가 처리.
+   - `TaskStatusUpdateEvent(state=WORKING, text=token)` — 프로세스 진행. ProcessEventQueue 가 events 테이블에 저장.
+3. `TaskStatusUpdateEvent(state=COMPLETED, text=full)` — 종료 알림 (선택)
+4. `TaskArtifactUpdateEvent(last_chunk=True, text=full)` — 최종 결과. 둘 다 처리 (chats / todolist).
+
+> 도구 호출 같은 도메인 sub-event 는 위 코드 흐름과 별개로, "도메인 sub-event 기록" 섹션의 패턴 (`metadata["event_type"]`) 을 참고해서 도구 호출 단위에서 emit 하세요.
 
 ```python
 import os
 
-from a2a.helpers import new_text_message
-from a2a.helpers import new_text_status_update_event
-from a2a.types import Role
-from a2a.types import TaskState
+from a2a.helpers import (
+    new_task,
+    new_text_artifact_update_event,
+    new_text_message,
+    new_text_status_update_event,
+)
+from a2a.types import Role, TaskState
 import litellm
 
 
 class MyExecutor(...):
     async def execute(self, context, event_queue):
-        # (선택) 중간 스트리밍(토큰/툴 이벤트)을 SSE로 흘리고 싶다면,
-        # A2A 표준 `TaskStatusUpdateEvent.metadata`에 "JSON 객체"를 담아 enqueue 하세요.
-        # 프레임워크가 이를 SSE `event: message`의 `data`로 변환해 발행합니다.
-        #
-        # 예: LiteLLM 프록시(OpenAI 호환) 스트리밍 → token 이벤트로 변환
         model = os.environ.get("LLM_MODEL")
         proxy_url = (os.environ.get("LLM_PROXY_URL") or "").rstrip("/")
         api_key = os.environ.get("LLM_PROXY_API_KEY")
         api_base = proxy_url if proxy_url.endswith("/v1") else f"{proxy_url}/v1"
 
-        # 채팅(SSE) 요청이면 Message-only로 응답하고,
-        # Message.metadata.chat_payload를 chats.messages에 그대로 저장합니다.
-        if (context.metadata or {}).get("request_kind") == "chat":
-            stream = await litellm.acompletion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant. Reply in Korean."},
-                    {"role": "user", "content": context.get_user_input()},
-                ],
-                temperature=0,
-                stream=True,
-                api_base=api_base,
-                api_key=api_key,
+        task_id = str(context.task_id)
+        context_id = str(context.context_id)
+
+        # 1) 라이프사이클 시작
+        await event_queue.enqueue_event(
+            new_task(task_id=task_id, context_id=context_id, state=TaskState.TASK_STATE_SUBMITTED)
+        )
+
+        # 2) LLM 스트리밍
+        stream = await litellm.acompletion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant. Reply in Korean."},
+                {"role": "user", "content": context.get_user_input()},
+            ],
+            temperature=0, stream=True,
+            api_base=api_base, api_key=api_key,
+        )
+
+        full = ""
+        async for chunk in stream:
+            try:
+                token = chunk.choices[0].delta.content
+            except Exception:
+                token = None
+            if not token:
+                continue
+            full += token
+
+            # 채팅용 — Message 1개 = SSE token 1개
+            await event_queue.enqueue_event(
+                new_text_message(text=token, role=Role.ROLE_AGENT)
             )
 
-            full = ""
-            async for chunk in stream:
-                try:
-                    token = chunk.choices[0].delta.content
-                except Exception:
-                    token = None
-                if not token:
-                    continue
-
-                full += token
-                tok_evt = new_text_status_update_event(
-                    task_id=context.task_id,
-                    context_id=context.context_id,
+            # 프로세스용 — events 테이블에 진행 row 1개씩.
+            # 부하가 우려되면 여기서 직접 필터링/집계 (예: JSON payload 단위로만 emit).
+            await event_queue.enqueue_event(
+                new_text_status_update_event(
+                    task_id=task_id, context_id=context_id,
                     state=TaskState.TASK_STATE_WORKING,
-                    text="",
+                    text=token,
                 )
-                tok_evt.metadata.update({"type": "token", "content": token})
-                await event_queue.enqueue_event(tok_evt)
-
-            msg = new_text_message(text=full, role=Role.ROLE_AGENT)
-            msg.metadata.update(
-                {
-                    "chat_payload": {
-                        # 이 payload는 외부 서비스가 원하는 형태로 자유롭게 구성하세요.
-                        "role": "assistant",
-                        "content": full,
-                        # (선택) conversation_id/tenant_id/user_uid 등은
-                        # 외부 서비스가 표준 필드로 실어 보내거나, 별도 저장 로직에서 주입하세요.
-                    }
-                }
             )
-            await event_queue.enqueue_event(msg)
-            return
 
-        # 그 외(폴링)는 Task lifecycle 패턴으로 처리 (Task → status/artifact)
-        ...
+        # 3) 종료 알림 (선택)
+        await event_queue.enqueue_event(
+            new_text_status_update_event(
+                task_id=task_id, context_id=context_id,
+                state=TaskState.TASK_STATE_COMPLETED,
+                text=full,
+            )
+        )
+
+        # 4) 최종 결과 — chats / todolist 양쪽이 동일 이벤트로 저장
+        await event_queue.enqueue_event(
+            new_text_artifact_update_event(
+                task_id=task_id, context_id=context_id,
+                name="assistant_response",
+                text=full,
+                last_chunk=True,
+            )
+        )
 ```
+
+> **저장 형식**: chats 테이블에 저장되는 payload 구조는 프레임워크가 책임집니다. Executor는 raw A2A 이벤트만 emit하면 됩니다. 저장 스키마를 바꾸고 싶다면 `mount_chat_sse(persist=...)`로 커스텀 persist 함수를 주입하세요.
+
+> **하위호환**: 기존에 채팅 경로에서 `Message`로 최종 응답을 emit하던 Executor도 그대로 동작합니다. `ChatEventQueue`는 `TaskArtifactUpdateEvent`(권장) 또는 `Message` 둘 다 최종 응답으로 받아들입니다.
 
 ### 4.3 채팅(SSE) 요청 예시
 
@@ -241,14 +347,11 @@ pip install "process-gpt-agent-sdk[sse]"
 
 ## 6. 사용법 (내 코드에 붙이기)
 
-핵심은 사용자 `AgentExecutor.execute()`가 **요청 경로에 따라** 아래 둘 중 하나를 선택하는 것입니다.
+핵심은 **Executor 안에서 모드를 분기하지 않는 것**입니다. 동일한 A2A 이벤트 시퀀스를 emit하면, 프레임워크의 EventQueue 구현체가 프로세스/채팅에 맞게 라우팅합니다.
 
-- **프로세스(폴링) 경로**: `Task lifecycle` (Task → status/artifact)
-  - 첫 이벤트는 반드시 `Task`
-  - 이후 `TaskStatusUpdateEvent` / `TaskArtifactUpdateEvent`만
-- **채팅(SSE) 경로**: `Message-only` (Message 1개)
-  - 정확히 1개의 `Message`만
-  - status/artifact/Task를 섞지 않음
+- 공통 이벤트 흐름: `Task` → `TaskStatusUpdateEvent[..]` → `TaskArtifactUpdateEvent(last_chunk=True)`
+- **프로세스(폴링) 경로**: `ProcessEventQueue`가 status는 events 테이블, artifact는 todolist 테이블에 저장
+- **채팅(SSE) 경로**: `ChatEventQueue`가 status는 SSE message 청크로, 최종 artifact는 SSE done + chats 테이블 저장으로 변환
 
 ### 6.1 프로세스(폴링)만 실행
 
