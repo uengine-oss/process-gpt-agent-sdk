@@ -44,6 +44,10 @@ class MinimalExecutor(AgentExecutor):
         context_id = str(context.context_id or "ctx-unknown")
         task_id = str(context.task_id or "task-unknown")
         user_text = context.get_user_input()
+        
+        context_data = context.get_context_data() or {}
+        row = context_data.get("row", {})
+        extras = context_data.get("extras", {})
 
         task_submitted_evt = new_text_status_update_event(
             task_id=task_id,

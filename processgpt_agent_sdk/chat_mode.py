@@ -85,7 +85,6 @@ class ChatRequestContext(RequestContext):
             "files": req.files,
             "file_count": req.file_count,
             "notify_user_emails": notify,
-            # 채팅(SSE) 청크 스트리밍용(방법 A)
             "streamer": streamer,
         }
 
@@ -245,6 +244,8 @@ def _build_chat_message_payload(req: ChatRequest, response_text: str) -> Dict[st
     """
     # 채팅 모드에서 assistant 메시지를 저장할 때, UI/백엔드에서 공통으로 기대하는 기본 actor 정보.
     meta: Dict[str, Any] = dict(req.metadata or {})
+    if "agent_profile" in meta:
+        meta["profile"] = meta.get("agent_profile")
     assistant_defaults: Dict[str, Any] = {
         "name": "Process GPT Agent",
         "role": "assistant",
@@ -257,7 +258,11 @@ def _build_chat_message_payload(req: ChatRequest, response_text: str) -> Dict[st
         if k in meta:
             assistant_defaults[k] = meta[k]
 
-    meta_rest = {k: v for k, v in meta.items() if k not in assistant_defaults}
+    meta_rest = {
+        k: v
+        for k, v in meta.items()
+        if k not in assistant_defaults and k != "agent_profile"
+    }
     return {
         **assistant_defaults,
         **meta_rest,
