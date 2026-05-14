@@ -436,6 +436,7 @@ class ProcessGPTAgentServer:
             out_q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
             streamer = ChatStreamer(out_q) if req.stream else None
             ctx = ChatRequestContext(req, streamer=streamer)
+            await ctx.prepare_context()
             q = ChatEventQueue(out_q, request=req, persist=persist_chat_to_db)
 
             # SSE contract: send initial metadata event

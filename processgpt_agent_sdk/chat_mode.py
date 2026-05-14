@@ -11,8 +11,9 @@ from a2a.types import Message, Task, TaskArtifactUpdateEvent, TaskStatusUpdateEv
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtobufMessage
 
-from .database import insert_chat_message
+from .database import insert_chat_message, fetch_users_grouped
 from .context_api import REQUEST_KIND_CHAT
+from .utils import set_agent_model
 
 
 # 채팅 모드에서 "최종 응답"으로 받아들이는 이벤트 타입.
@@ -87,6 +88,27 @@ class ChatRequestContext(RequestContext):
             "notify_user_emails": notify,
             "streamer": streamer,
         }
+
+    async def prepare_context(self) -> None:
+        """메타데이터에 participant_agent_ids가 있으면 에이전트 정보를 조회하여 extras에 추가합니다."""
+        participant_ids = (self.req.metadata or {}).get("participant_agent_ids")
+        if not participant_ids:
+            return
+
+        # 문자열이면 리스트로 변환 (콤마 구분)
+        if isinstance(participant_ids, str):
+            participant_ids = [pid.strip() for pid in participant_ids.split(",") if pid.strip()]
+
+        # 자기 자신(process-gpt-agent)은 DB 조회 대상에서 제외
+        participant_ids = [pid for pid in participant_ids if pid != "process-gpt-agent"]
+
+        if not participant_ids:
+            return
+
+        agents, _users = await fetch_users_grouped(participant_ids)
+        if agents:
+            set_agent_model(agents[0])
+        self._extras["agents"] = agents
 
     def get_user_input(self) -> str:
         return self._user_input
