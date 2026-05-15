@@ -3,6 +3,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, List, Union
 from uuid import uuid4
+from datetime import datetime, timezone
 
 from a2a.helpers import get_artifact_text, get_message_text
 from a2a.server.agent_execution import RequestContext
@@ -272,6 +273,7 @@ def _build_chat_message_payload(req: ChatRequest, event: FinalEvent, response_te
         "profile": "/images/chat-icon.png",
         "userName": "Process GPT Agent",
         "content": response_text,
+        "timeStamp": datetime.now(timezone.utc).isoformat(),
     }
 
     req_meta = req.metadata or {}
