@@ -259,42 +259,44 @@ class ChatStreamer:
         await self._out_queue.put({"event": "message", "data": data})
 
 
-def _build_chat_message_payload(req: ChatRequest, response_text: str) -> Dict[str, Any]:
+def _build_chat_message_payload(req: ChatRequest, event: FinalEvent, response_text: str) -> Dict[str, Any]:
     """chats.messages에 저장할 표준 payload를 구성합니다.
 
     Executor는 A2A 이벤트만 emit하면 되고, 저장 형식은 프레임워크가 결정합니다.
     """
-    # 채팅 모드에서 assistant 메시지를 저장할 때, UI/백엔드에서 공통으로 기대하는 기본 actor 정보.
-    meta: Dict[str, Any] = dict(req.metadata or {})
-    if "agent_profile" in meta:
-        meta["profile"] = meta.get("agent_profile")
-    assistant_defaults: Dict[str, Any] = {
+    payload: Dict[str, Any] = {
         "name": "Process GPT Agent",
         "role": "assistant",
         "email": "agent:process-gpt-agent",
         "agentId": "process-gpt-agent",
         "profile": "/images/chat-icon.png",
         "userName": "Process GPT Agent",
-    }
-    for k in list(assistant_defaults.keys()):
-        if k in meta:
-            assistant_defaults[k] = meta[k]
-
-    meta_rest = {
-        k: v
-        for k, v in meta.items()
-        if k not in assistant_defaults and k != "agent_profile"
-    }
-    return {
-        **assistant_defaults,
-        **meta_rest,
         "content": response_text,
     }
+
+    req_meta = req.metadata or {}
+    agent_profile = req_meta.get("agent_profile")
+    if isinstance(agent_profile, dict):
+        payload.update(agent_profile)
+
+    try:
+        # Protobuf message일 경우 dict로 변환하여 metadata 추출
+        event_dict = MessageToDict(event, preserving_proto_field_name=True)
+        event_meta = event_dict.get("metadata")
+        if isinstance(event_meta, dict):
+            payload.update(event_meta)
+    except Exception:
+        # Protobuf message가 아니거나 변환 실패 시 속성 직접 접근
+        event_meta = getattr(event, "metadata", None)
+        if isinstance(event_meta, dict):
+            payload.update(event_meta)
+
+    return payload
 
 
 async def persist_chat_to_db(req: ChatRequest, event: FinalEvent, response_text: str) -> None:
     """chats 테이블에 '단일 메시지 row'를 저장합니다."""
-    payload = _build_chat_message_payload(req, response_text)
+    payload = _build_chat_message_payload(req, event, response_text)
     message_uuid = uuid4().hex
     chat_id = req.conversation_id or message_uuid
     await insert_chat_message(
