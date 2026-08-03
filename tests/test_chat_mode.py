@@ -11,7 +11,13 @@ from a2a.helpers import (
 from a2a.types import Role
 from a2a.types import TaskState
 
-from processgpt_agent_sdk.chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext, ChatStreamer
+from processgpt_agent_sdk.chat_mode import (
+    ChatEventQueue,
+    ChatRequest,
+    ChatRequestContext,
+    ChatStreamer,
+    _build_chat_message_payload,
+)
 
 
 class TestChatEventQueue(unittest.IsolatedAsyncioTestCase):
@@ -194,6 +200,59 @@ class TestChatRequestContext(TestCase):
         self.assertEqual(ex["input_data"]["user_jwt"], "tok")
         self.assertEqual(ex["input_data"]["metadata"], {"x": 1})
         self.assertEqual(ex["notify_user_emails"], ["a@b.c"])
+
+
+class TestBuildChatMessagePayload(TestCase):
+    """agent_profile(id/username) → payload(agentId/name/userName/email) 매핑.
+
+    프론트가 실제 응답 에이전트의 agent_profile을 보내도 필드명이 달라(id vs agentId,
+    username vs userName) payload.update()만으로는 반영되지 않고 항상 기본값
+    (process-gpt-agent)으로 저장되던 버그의 회귀 테스트.
+    """
+
+    def test_agent_profile_overrides_default_identity(self):
+        req = ChatRequest(
+            message="hello",
+            metadata={
+                "agent_profile": {
+                    "id": "00f64687-fcb2-d6b9-cee2-da75728c1c51",
+                    "username": "재고 데이터 조회 에이전트",
+                    "role": "inventory",
+                }
+            },
+        )
+        msg = new_text_message("답변", role=Role.ROLE_AGENT)
+
+        payload = _build_chat_message_payload(req, msg, "답변")
+
+        self.assertEqual(payload["agentId"], "00f64687-fcb2-d6b9-cee2-da75728c1c51")
+        self.assertEqual(payload["email"], "agent:00f64687-fcb2-d6b9-cee2-da75728c1c51")
+        self.assertEqual(payload["name"], "재고 데이터 조회 에이전트")
+        self.assertEqual(payload["userName"], "재고 데이터 조회 에이전트")
+        self.assertEqual(payload["role"], "inventory")
+
+    def test_missing_agent_profile_keeps_default_identity(self):
+        req = ChatRequest(message="hello")
+        msg = new_text_message("답변", role=Role.ROLE_AGENT)
+
+        payload = _build_chat_message_payload(req, msg, "답변")
+
+        self.assertEqual(payload["agentId"], "process-gpt-agent")
+        self.assertEqual(payload["email"], "agent:process-gpt-agent")
+        self.assertEqual(payload["name"], "Process GPT Agent")
+        self.assertEqual(payload["userName"], "Process GPT Agent")
+
+    def test_agent_profile_explicit_email_is_respected(self):
+        req = ChatRequest(
+            message="hello",
+            metadata={"agent_profile": {"id": "abc-123", "email": "custom@agent.io"}},
+        )
+        msg = new_text_message("답변", role=Role.ROLE_AGENT)
+
+        payload = _build_chat_message_payload(req, msg, "답변")
+
+        self.assertEqual(payload["agentId"], "abc-123")
+        self.assertEqual(payload["email"], "custom@agent.io")
 
 
 if __name__ == "__main__":

@@ -18,10 +18,13 @@ if [[ -f .env ]]; then
 fi
 
 # 1) 버전 반영
+# BSD sed(-E, macOS 기본)는 \s 같은 Perl 스타일 클래스를 지원하지 않아 이 패턴이
+# 조용히(에러 없이) 매치 실패해 버전이 그대로 남는 버그가 있었다. [[:space:]]는
+# POSIX ERE 문법이라 GNU/BSD sed 양쪽에서 동일하게 동작한다.
 if sed --version >/dev/null 2>&1; then
-  sed -i -E "s/^version\s*=\s*\"[^\"]+\"/version = \"$VERSION\"/" pyproject.toml
+  sed -i -E "s/^version[[:space:]]*=[[:space:]]*\"[^\"]+\"/version = \"$VERSION\"/" pyproject.toml
 else
-  sed -i '' -E "s/^version\s*=\s*\"[^\"]+\"/version = \"$VERSION\"/" pyproject.toml
+  sed -i '' -E "s/^version[[:space:]]*=[[:space:]]*\"[^\"]+\"/version = \"$VERSION\"/" pyproject.toml
 fi
 
 # 2) 빌드 정리 및 생성

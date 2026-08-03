@@ -279,6 +279,19 @@ def _build_chat_message_payload(req: ChatRequest, event: FinalEvent, response_te
     req_meta = req.metadata or {}
     agent_profile = req_meta.get("agent_profile")
     if isinstance(agent_profile, dict):
+        # agent_profile은 프론트가 보내는 실제 응답 에이전트 식별자다. 필드명이
+        # payload 표준 키(agentId/userName)와 달라(id/username) 아래 update()만으로는
+        # 절대 반영되지 않아, 항상 기본값(process-gpt-agent)으로 저장되고 realtime
+        # 매칭이 깨지는 버그가 있었다. agentId/email/name/userName을 먼저 명시적으로
+        # 매핑한 뒤, 나머지 설명 필드(alias/role/goal 등)는 그대로 병합한다.
+        agent_id = str(agent_profile.get("id") or "").strip()
+        username = str(agent_profile.get("username") or "").strip()
+        if agent_id:
+            payload["agentId"] = agent_id
+            payload["email"] = agent_profile.get("email") or f"agent:{agent_id}"
+        if username:
+            payload["name"] = username
+            payload["userName"] = username
         payload.update(agent_profile)
 
     try:
