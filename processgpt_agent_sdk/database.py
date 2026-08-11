@@ -207,6 +207,30 @@ async def fetch_todo_by_id(todo_id: str) -> Optional[Dict[str, Any]]:
 
     return row
 
+
+async def fetch_todo_draft_status(todo_id: str) -> Optional[str]:
+    """취소 감지 폴링 전용 경량 조회: draft_status 컬럼만 가져온다.
+
+    fetch_todo_by_id는 컨텍스트 준비용으로 전체 행(select *)을 가져오지만, 실행 중
+    반복 폴링에는 컬럼 하나면 충분하다.
+    """
+    if not todo_id:
+        return None
+
+    def _call():
+        client = get_db_client()
+        resp = (
+            client.table("todolist")
+            .select("draft_status")
+            .eq("id", todo_id)
+            .single()
+            .execute()
+        )
+        row = getattr(resp, "data", None)
+        return (row or {}).get("draft_status")
+
+    return await _async_retry(_call, name="fetch_todo_draft_status", retries=1, fallback=lambda: None)
+
 # ------------------------------ Events & Results ------------------------------
 async def record_events_bulk(payloads: List[Dict[str, Any]]) -> None:
     """이벤트 다건 저장 함수"""

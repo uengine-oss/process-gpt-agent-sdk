@@ -23,6 +23,7 @@ from .database import (
     fetch_email_users_by_proc_inst_id,
     fetch_tenant_mcp,
     fetch_proc_inst_sources,
+    fetch_todo_draft_status,
 )
 from .utils import summarize_error_to_user, summarize_feedback, set_agent_model
 from .event_queue_process import ProcessEventQueue, ProcessGPTEventQueue
@@ -294,6 +295,36 @@ class ProcessGPTAgentServer:
 
         logger.info("👋 Agent server stopped.")
 
+    async def _watch_todo_cancellation(
+        self,
+        context: "ProcessGPTRequestContext",
+        event_queue: "ProcessEventQueue",
+        task_id: str,
+        exec_task: asyncio.Task,
+        interval: float = 2.0,
+    ) -> None:
+        """실행 중인 todo의 draft_status가 CANCELLED로 바뀌는지 폴링한다.
+
+        프론트의 취소 버튼은 todolist.draft_status를 직접 갱신할 뿐 이 서버에 신호를
+        보내지 않는다. execute()는 완료될 때까지 단순히 await되므로, 이 워처가
+        exec_task와 나란히 돌면서 취소를 감지해 executor.cancel()을 호출하고
+        exec_task 자체를 취소시킨다 — 특정 Executor 구현이 아니라 프레임워크
+        차원에서 모든 Executor에 동일하게 적용된다.
+        """
+        while not exec_task.done():
+            await asyncio.sleep(interval)
+            if exec_task.done():
+                return
+            status = str(await fetch_todo_draft_status(task_id) or "").strip().upper()
+            if status == "CANCELLED":
+                logger.info("🛑 [작업 취소 감지] Task ID: %s", task_id)
+                try:
+                    await self.agent_executor.cancel(context, event_queue)
+                except Exception:
+                    logger.exception("agent_executor.cancel() 실패 | task_id=%s", task_id)
+                exec_task.cancel()
+                return
+
     async def process_todolist_item(self, row: Dict[str, Any]):
         """
         경계 정책(최종본):
@@ -303,10 +334,12 @@ class ProcessGPTAgentServer:
           2) event_type='error' 단건 이벤트 기록
           3) todolist를 FAILED로 마킹
           4) 예외 재전달(상위 루프는 죽지 않고 다음 폴링)
+        - 단, 취소(draft_status=CANCELLED)로 인한 CancelledError는 실패가 아니므로
+          FAILED 마킹 없이 조용히 종료한다.
         """
         task_id = row.get("id")
         logger.info("\n🎯 [작업 처리 시작] Task ID: %s", task_id)
-        
+
         friendly_text: Optional[str] = None
 
         try:
@@ -314,12 +347,27 @@ class ProcessGPTAgentServer:
             context = ProcessGPTRequestContext(row)
             await context.prepare_context()
 
-            # 2) 실행
+            # 2) 실행 (취소 워처와 동시에)
             logger.info("\n\n🤖 [Agent Orchestrator 실행]")
             event_queue = ProcessEventQueue(str(task_id), self.agent_orch, row.get("proc_inst_id"))
-            await self.agent_executor.execute(context, event_queue)
+            exec_task = asyncio.create_task(self.agent_executor.execute(context, event_queue))
+            watch_task = asyncio.create_task(
+                self._watch_todo_cancellation(context, event_queue, str(task_id), exec_task)
+            )
+            try:
+                await exec_task
+            finally:
+                watch_task.cancel()
+                try:
+                    await watch_task
+                except asyncio.CancelledError:
+                    pass
             event_queue.task_done()
             logger.info("\n\n🎉 [Agent Orchestrator 완료] Task ID: %s", task_id)
+
+        except asyncio.CancelledError:
+            logger.info("🛑 작업이 취소되어 종료 | Task ID: %s", task_id)
+            return
 
         except Exception as e:
             logger.error("❌ 작업 처리 중 오류 발생: %s", str(e))
