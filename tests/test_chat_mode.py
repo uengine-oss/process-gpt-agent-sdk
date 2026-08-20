@@ -157,6 +157,64 @@ class TestChatEventQueue(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][1], "hi")
         self.assertEqual(calls[0][2], "TaskArtifactUpdateEvent")
 
+    async def test_persist_chat_to_db_reuses_client_response_message_uuid(self):
+        """response_message_uuid가 주어지면 그 uuid로 upsert해 클라이언트가 스트리밍
+        중 먼저 저장해둔 assistant row를 그대로 확정 갱신해야 한다 — 새 uuid를 발급해
+        별도 row로 다시 저장하면 같은 턴이 chats 테이블에 두 번 남는다(원래 버그)."""
+        from processgpt_agent_sdk import chat_mode as chat_mode_module
+
+        calls = []
+
+        async def _fake_insert(*, uuid, chat_id, messages, tenant_id=None, thread_id=None):
+            calls.append(uuid)
+
+        original = chat_mode_module.insert_chat_message
+        chat_mode_module.insert_chat_message = _fake_insert
+        try:
+            req = ChatRequest(
+                message="user",
+                conversation_id="room-1",
+                response_message_uuid="assistant-uuid-123",
+            )
+            evt = new_text_artifact_update_event(
+                task_id="t1", context_id="c1", name="r", text="hi", last_chunk=True,
+            )
+            await chat_mode_module.persist_chat_to_db(req, evt, "hi")
+        finally:
+            chat_mode_module.insert_chat_message = original
+
+        self.assertEqual(calls, ["assistant-uuid-123"])
+
+    def test_chat_request_has_no_generic_message_uuid_field(self):
+        """user 메시지 uuid는 ChatRequest가 아니라 HTTP 바디/컨텍스트 레벨에서만 다뤄야
+        한다 — assistant 저장용 response_message_uuid와 헷갈려 재도입되면 assistant
+        응답이 user 메시지 row(같은 PK)를 덮어쓰는 회귀가 생긴다."""
+        with self.assertRaises(TypeError):
+            ChatRequest(message="user", message_uuid="should-not-exist")
+
+    async def test_persist_chat_to_db_generates_uuid_when_missing(self):
+        """레거시 클라이언트(response_message_uuid 미전달)는 기존처럼 새 uuid를 발급해야 한다."""
+        from processgpt_agent_sdk import chat_mode as chat_mode_module
+
+        calls = []
+
+        async def _fake_insert(*, uuid, chat_id, messages, tenant_id=None, thread_id=None):
+            calls.append(uuid)
+
+        original = chat_mode_module.insert_chat_message
+        chat_mode_module.insert_chat_message = _fake_insert
+        try:
+            req = ChatRequest(message="user", conversation_id="room-1")
+            evt = new_text_artifact_update_event(
+                task_id="t1", context_id="c1", name="r", text="hi", last_chunk=True,
+            )
+            await chat_mode_module.persist_chat_to_db(req, evt, "hi")
+        finally:
+            chat_mode_module.insert_chat_message = original
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0])
+
     async def test_streamer_emits_chunks(self):
         out_q: asyncio.Queue[dict] = asyncio.Queue()
         streamer = ChatStreamer(out_q)

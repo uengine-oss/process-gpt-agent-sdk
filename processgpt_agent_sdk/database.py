@@ -311,9 +311,12 @@ async def insert_chat_message(
     tenant_id: Optional[str] = None,
     thread_id: Optional[str] = None,
 ) -> None:
-    """채팅 메시지를 chats 테이블에 저장(insert)합니다. (1 row = 1 message)
+    """채팅 메시지를 chats 테이블에 upsert합니다. (1 row = 1 message, PK=uuid)
 
-    - `uuid`: chats.uuid (PK)
+    - `uuid`: chats.uuid (PK). 이미 그 uuid로 row가 있으면(예: 클라이언트가 스트리밍
+      중 낙관적으로 먼저 저장해둔 row) insert 충돌 대신 그 row를 갱신한다 — 같은
+      논리적 메시지가 클라이언트/서버 양쪽에서 각자 다른 uuid로 중복 저장되는 걸
+      막으려면 호출자가 동일한 uuid를 넘겨야 한다.
     - `chat_id`: chats.id (NOT NULL; 외부 서비스가 의미를 부여. 보통 conversation_id/thread_id를 권장)
     - `messages`: chats.messages (jsonb)
     - `tenant_id`: 선택. 미지정 시 DB default(public.tenant_id())에 위임될 수 있음
@@ -336,7 +339,7 @@ async def insert_chat_message(
 
     def _call():
         client = get_db_client()
-        return client.table("chats").insert(payload).execute()
+        return client.table("chats").upsert(payload, on_conflict="uuid").execute()
 
     res = await _async_retry(_call, name="insert_chat_message", retries=1, fallback=lambda: None)
     if res is None and tenant_id:
@@ -346,7 +349,7 @@ async def insert_chat_message(
 
         def _call_wo_tenant():
             client = get_db_client()
-            return client.table("chats").insert(payload_wo_tenant).execute()
+            return client.table("chats").upsert(payload_wo_tenant, on_conflict="uuid").execute()
 
         res = await _async_retry(_call_wo_tenant, name="insert_chat_message_without_tenant", retries=1, fallback=lambda: None)
 

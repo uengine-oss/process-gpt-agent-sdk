@@ -479,6 +479,10 @@ class ProcessGPTAgentServer:
                 file_count=int(body.get("file_count") or 0),
                 stream=bool(body.get("stream") if body.get("stream") is not None else True),
                 metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
+                # 주의: body["message_uuid"]는 "사용자" 메시지의 클라이언트 uuid라 여기선 쓰지
+                # 않는다(assistant row에 재사용하면 user 메시지 row를 덮어쓴다). assistant 응답
+                # 저장용 uuid는 별도 필드(response_message_uuid)로만 받는다.
+                response_message_uuid=(str(body.get("response_message_uuid") or "").strip() or None),
             )
 
             out_q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()

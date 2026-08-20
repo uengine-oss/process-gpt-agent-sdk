@@ -39,6 +39,14 @@ class ChatRequest:
     file_count: int = 0
     stream: bool = True
     metadata: Dict[str, Any] = None
+    # 주의: `message_uuid`(위 프로토콜 관례상 존재할 수 있는 필드)는 "사용자" 메시지의
+    # 클라이언트 uuid로 쓰이는 경우가 있어 여기서 재사용하면 안 된다 — assistant 응답을
+    # 그 uuid로 upsert하면 chats.uuid(PK)가 같은 user 메시지 row를 덮어써버린다.
+    # 그래서 assistant 쪽 전용 필드를 이름부터 다르게 둔다: 클라이언트가 스트리밍 중 미리
+    # 만들어 자체 저장해 둔 "assistant 응답" row의 chats.uuid. persist_chat_to_db가 이
+    # 값을 그대로 재사용해 upsert하면, 같은 턴에 대해 클라이언트 row와 서버 확정 row가
+    # 서로 다른 uuid로 중복 저장되는 걸 막을 수 있다.
+    response_message_uuid: Optional[str] = None
 
     def __post_init__(self):
         if self.files is None:
@@ -310,9 +318,17 @@ def _build_chat_message_payload(req: ChatRequest, event: FinalEvent, response_te
 
 
 async def persist_chat_to_db(req: ChatRequest, event: FinalEvent, response_text: str) -> None:
-    """chats 테이블에 '단일 메시지 row'를 저장합니다."""
+    """chats 테이블에 '단일 메시지 row'를 저장(upsert)합니다.
+
+    req.response_message_uuid가 있으면 그 uuid로 upsert한다 — 클라이언트가 스트리밍
+    중 같은 uuid로 이미 낙관적 저장을 해뒀다면 새 row를 만드는 대신 그 row를 확정
+    상태로 갱신하게 되어, 같은 턴이 두 개의 chats row로 중복 저장되는 걸 막는다.
+    (req.message_uuid는 별개로 "사용자" 메시지의 uuid이므로 여기서 쓰면 안 된다 —
+    그 값을 assistant row에 재사용하면 chats.uuid(PK)가 같은 user 메시지 row를
+    덮어써버린다.) 없으면(레거시 클라이언트) 기존처럼 새 uuid를 발급한다.
+    """
     payload = _build_chat_message_payload(req, event, response_text)
-    message_uuid = uuid4().hex
+    message_uuid = (req.response_message_uuid or "").strip() or uuid4().hex
     chat_id = req.conversation_id or message_uuid
     await insert_chat_message(
         uuid=message_uuid,
