@@ -627,3 +627,36 @@ async def fetch_proc_inst_sources(proc_inst_id: str) -> List[Dict[str, Any]]:
         rows = []
 
     return rows
+
+async def fetch_chat_room_tenant_id(conversation_id: str) -> str:
+    """대화방(chat_rooms)의 소유 테넌트를 조회한다.
+
+    재접속(attach)·중지(stop) 요청이 "요청자의 검증된 테넌트 == 방 소유 테넌트" 인지
+    확인하는 데 쓴다. 이 검사가 없으면 방 ID 만 아는 외부인이 남의 스트림에 붙거나
+    남의 턴을 중지시킬 수 있다.
+
+    조회에 실패하면 빈 문자열을 돌려준다 — 호출부는 이를 "확인 불가" 로 보고
+    거부해야 한다(fail-closed).
+    """
+    if not conversation_id:
+        return ""
+
+    def _query() -> str:
+        try:
+            client = get_db_client()
+            resp = (
+                client.table("chat_rooms")
+                .select("tenant_id")
+                .eq("id", conversation_id)
+                .execute()
+            )
+            rows = getattr(resp, "data", None) or []
+            if rows and isinstance(rows[0], dict):
+                return str(rows[0].get("tenant_id") or "")
+        except Exception:
+            logger.warning(
+                "fetch_chat_room_tenant_id 실패 conversation_id=%s", conversation_id, exc_info=True
+            )
+        return ""
+
+    return await asyncio.to_thread(_query)

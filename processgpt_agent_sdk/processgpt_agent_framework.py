@@ -29,6 +29,18 @@ from .utils import summarize_error_to_user, summarize_feedback, set_agent_model
 from .event_queue_process import ProcessEventQueue, ProcessGPTEventQueue
 from .chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext, ChatStreamer, drain_sse_queue, persist_chat_to_db
 from .context_api import REQUEST_KIND_PROCESS
+from .chat_registry import (
+    RunRecordingQueue,
+    get_inflight_registry,
+    get_run_registry,
+)
+from .chat_sse import (
+    add_route as _add_route,
+    apply_heartbeat,
+    make_attach_handler,
+    make_stop_handler,
+)
+from .tenant_auth import ChatTenantGuardMiddleware
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -237,12 +249,27 @@ class ProcessGPTRequestContext(RequestContext):
 
 # ------------------------------ Agent Server ------------------------------
 class ProcessGPTAgentServer:
-    def __init__(self, agent_executor: AgentExecutor, agent_type: str):
+    def __init__(
+        self,
+        agent_executor: AgentExecutor,
+        agent_type: str,
+        *,
+        tenant_auth: bool = True,
+    ):
+        """
+        Args:
+            tenant_auth: 채팅 라우트의 tenant_id 를 요청자의 JWT 로 검증할지 여부.
+                기본값은 검증함이다 — 검증하지 않으면 본문 tenant_id 가 그대로
+                에이전트의 스킬 로드·샌드박스 마운트·작업공간 경로까지 흘러가,
+                값만 바꿔 호출하면 남의 테넌트 자원에 닿을 수 있다.
+                로컬 개발이나 인증 앞단이 따로 있는 배포에서만 끈다.
+        """
         self.agent_executor = agent_executor
         self.agent_orch = agent_type
         self.is_running = False
         self._shutdown_event = asyncio.Event()
         self._current_todo_id: Optional[str] = None  # 진행 중 작업 추적(참고용)
+        self.tenant_auth = tenant_auth
 
     async def _install_signal_handlers(self):
         loop = asyncio.get_running_loop()
@@ -485,14 +512,27 @@ class ProcessGPTAgentServer:
                 response_message_uuid=(str(body.get("response_message_uuid") or "").strip() or None),
             )
 
-            out_q: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
-            streamer = ChatStreamer(out_q) if req.stream else None
-            ctx = ChatRequestContext(req, streamer=streamer)
+            ctx = ChatRequestContext(req, streamer=None)
+            conversation_id = ctx.context_id
+
+            # 이 방에서 이미 돌고 있는 턴이 있으면 먼저 끊는다. 프론트는 로딩 중
+            # 새 메시지를 보낼 때 자기 쪽 fetch 만 끊고 서버에는 취소 신호를 주지
+            # 않으므로, 이게 없으면 같은 방에 두 실행이 겹친다.
+            await get_inflight_registry().cancel(conversation_id)
+
+            # 큐 한 곳만 가로채면 ChatStreamer(토큰)와 ChatEventQueue(done)가 내보내는
+            # 이벤트 전부가 레지스트리에 남는다 — 재접속한 클라이언트가 받는 것과
+            # 원래 클라이언트가 받는 것이 정의상 같아진다.
+            out_q: asyncio.Queue[Dict[str, Any]] = RunRecordingQueue(conversation_id)
+            await get_run_registry().start_run(conversation_id)
+
+            if req.stream:
+                ctx.set_streamer(ChatStreamer(out_q))
             await ctx.prepare_context()
             q = ChatEventQueue(out_q, request=req, persist=persist_chat_to_db)
 
             # SSE contract: send initial metadata event
-            await out_q.put({"event": "metadata", "data": {"conversation_id": ctx.context_id}})
+            await out_q.put({"event": "metadata", "data": {"conversation_id": conversation_id}})
 
             async def _run_executor():
                 try:
@@ -501,6 +541,13 @@ class ProcessGPTAgentServer:
                     # 최종 artifact를 emit하지 않는 Executor를 위해, 그 경우에만 빈 done을 보냅니다.
                     if not getattr(q, "_finalized", False):
                         await out_q.put({"event": "message", "data": {"type": "done"}})
+                except asyncio.CancelledError:
+                    # 중지 요청(/chat/stop)이나 같은 방의 새 턴에 밀린 경우. 스트림을
+                    # 열어 둔 채 끝내면 브라우저가 영원히 기다리므로 종료를 알린다.
+                    await out_q.put(
+                        {"event": "message", "data": {"type": "error", "error": "turn cancelled"}}
+                    )
+                    raise
                 except Exception as ex:
                     await out_q.put(
                         {
@@ -509,13 +556,65 @@ class ProcessGPTAgentServer:
                         }
                     )
 
-            asyncio.create_task(_run_executor())
-            return StreamingResponse(drain_sse_queue(out_q), media_type="text/event-stream")
+            task = asyncio.create_task(_run_executor())
+            get_inflight_registry().set_inflight(conversation_id, task)
+            return apply_heartbeat(
+                StreamingResponse(drain_sse_queue(out_q), media_type="text/event-stream")
+            )
 
-        # FastAPI: add_api_route, Starlette: add_route
-        if hasattr(app, "add_api_route"):
-            app.add_api_route(path, handler, methods=["POST"])
-        elif hasattr(app, "add_route"):
-            app.add_route(path, handler, methods=["POST"])
-        else:  # pragma: no cover
-            raise TypeError("Unsupported app type: expected FastAPI or Starlette-like app with add_route/add_api_route.")
+        # Starlette 라우트로 등록한다. FastAPI 의 add_api_route() 에 넘기면 핸들러
+        # 시그니처(타입 주석 없는 `request`)를 필수 쿼리 파라미터로 해석해 모든
+        # 요청이 422 로 떨어진다 — 자세한 사정은 chat_sse.add_route 참고.
+        _add_route(app, path, handler, methods=["POST"])
+        return handler
+
+    def mount_chat_routes(
+        self,
+        app: Any,
+        *,
+        stream_paths: tuple = ("/chat/stream",),
+        attach_path: Optional[str] = "/chat/stream/attach",
+        stop_path: Optional[str] = "/chat/stop",
+    ):
+        """채팅 SSE 라우트 한 벌을 통째로 마운트한다.
+
+        `mount_chat_sse()` 가 스트림 하나만 붙이는 반면, 이쪽은 재접속·중지까지
+        같이 붙이고 tenant_auth 가 켜져 있으면 스트림 경로에 검증 미들웨어도 건다.
+        새로 붙이는 서버는 이 함수 하나만 부르면 된다.
+
+        Args:
+            stream_paths: 같은 스트림 핸들러를 등록할 경로들. 예전 프론트가 쓰던
+                `/{agent_id}/chat/stream` 같은 별칭을 함께 넘길 수 있다.
+            attach_path: None 이면 재접속 라우트를 붙이지 않는다.
+            stop_path: None 이면 중지 라우트를 붙이지 않는다.
+        """
+        for path in stream_paths:
+            self.mount_chat_sse(app, path=path)
+
+        if attach_path:
+            _add_route(
+                app, attach_path,
+                make_attach_handler(require_auth=self.tenant_auth), methods=["POST"],
+            )
+        if stop_path:
+            _add_route(
+                app, stop_path,
+                make_stop_handler(require_auth=self.tenant_auth), methods=["POST"],
+            )
+
+        if self.tenant_auth:
+            # 스트림 경로는 프레임워크가 소유해 데코레이터를 달 수 없으므로 미들웨어로
+            # 앞단에서 검증한다. attach/stop 은 핸들러 안에서 직접 검증한다.
+            add_middleware = getattr(app, "add_middleware", None)
+            if add_middleware is None:  # pragma: no cover
+                raise TypeError(
+                    "tenant_auth=True 에는 add_middleware 를 지원하는 앱이 필요합니다. "
+                    "직접 ChatTenantGuardMiddleware 를 감싸거나 tenant_auth=False 로 두세요."
+                )
+            add_middleware(ChatTenantGuardMiddleware, paths=tuple(stream_paths))
+            logger.info("🔐 채팅 테넌트 검증 활성화: %s", ", ".join(stream_paths))
+        else:
+            logger.warning(
+                "⚠️  tenant_auth=False — 채팅 요청의 tenant_id 를 검증하지 않습니다. "
+                "요청 본문 값이 그대로 에이전트로 전달됩니다."
+            )

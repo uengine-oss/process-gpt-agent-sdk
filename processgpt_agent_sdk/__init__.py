@@ -20,10 +20,38 @@ from .database import (
     fetch_email_users_by_proc_inst_id,
     fetch_tenant_mcp,
     fetch_proc_inst_sources,
+    fetch_chat_room_tenant_id,
 )
 from .utils import (
     summarize_error_to_user,
     summarize_feedback,
+)
+from .chat_registry import (
+    ChatRunRegistry,
+    InflightRegistry,
+    get_run_registry,
+    set_run_registry,
+    get_inflight_registry,
+    set_inflight_registry,
+)
+from .chat_sse import (
+    with_heartbeat,
+    apply_heartbeat,
+    format_sse_message,
+    make_attach_handler,
+    make_stop_handler,
+)
+from .tenant_auth import (
+    ChatTenantGuardMiddleware,
+    RequestIdentity,
+    TenantAuthError,
+    auth_guard,
+    authorize_tenant,
+    request_tenant_id,
+    request_user_id,
+    resolve_identity,
+    tenant_guard,
+    verify_token,
 )
 from .integrations.storage import upload_file_to_bucket, upload_files_to_bucket
 from .single_run import run_single_todo_readonly
@@ -42,6 +70,29 @@ __all__ = [
     "emit_chunk_text",
     "emit_chunk_json",
     "ContextPreparationError",
+    # 채팅 SSE 전송 계층
+    "ChatRunRegistry",
+    "InflightRegistry",
+    "get_run_registry",
+    "set_run_registry",
+    "get_inflight_registry",
+    "set_inflight_registry",
+    "with_heartbeat",
+    "apply_heartbeat",
+    "format_sse_message",
+    "make_attach_handler",
+    "make_stop_handler",
+    # 테넌트 인증
+    "ChatTenantGuardMiddleware",
+    "RequestIdentity",
+    "TenantAuthError",
+    "auth_guard",
+    "authorize_tenant",
+    "request_tenant_id",
+    "request_user_id",
+    "resolve_identity",
+    "tenant_guard",
+    "verify_token",
     "initialize_db",
     "get_consumer_id",
     "polling_pending_todos",
@@ -54,6 +105,7 @@ __all__ = [
     "fetch_email_users_by_proc_inst_id",
     "fetch_tenant_mcp",
     "fetch_proc_inst_sources",
+    "fetch_chat_room_tenant_id",
     "summarize_error_to_user",
     "summarize_feedback",
     "upload_file_to_bucket",

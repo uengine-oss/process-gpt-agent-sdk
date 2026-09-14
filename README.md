@@ -7,8 +7,16 @@
 - **컨텍스트 준비** (사용자 정보, 폼 정의, MCP 설정 등 자동으로 조회)  
 - 다양한 **에이전트 오케스트레이션(A2A)** 과 호환  
 - **이벤트(Event) 전송 규격 통일화** → 결과를 DB에 안전하게 저장  
+- **채팅(SSE) 전송 계층** → 하트비트 · 재접속(attach) · 중지(stop) 를 프레임워크가 제공  
+- **테넌트 인증** → 요청이 보낸 `tenant_id` 를 요청자의 JWT 로 검증  
 
 👉 쉽게 말하면: **여러 종류의 AI 에이전트를 같은 규칙으로 실행/저장/호출할 수 있게 해주는 통합 SDK** 입니다.  
+
+> **0.5.0 에서 달라진 점**  
+> 채팅 SSE 전송 계층과 테넌트 인증이 SDK 로 올라왔습니다. 그동안 각 에이전트
+> 저장소가 따로 만들어 쓰던 하트비트·재접속·중지·인증을 `mount_chat_routes()`
+> 한 번으로 대체할 수 있습니다. 자세한 내용은 4.5 · 4.6 을 보세요.
+> 기존 `mount_chat_sse()` 단독 호출은 동작이 그대로라 곧바로 올려도 깨지지 않습니다.
 
 ---
 
@@ -20,6 +28,10 @@ flowchart TD
         E[events]:::db
     end
 
+    subgraph DB2[Postgres/Supabase]
+        CH[chats]:::db
+    end
+
     subgraph SDK
         P[Polling\n(fetch_pending_task)] --> C[Context 준비\n(fetch_context_bundle 등)]
         C --> X[Executor\n(MinimalExecutor)]
@@ -27,12 +39,24 @@ flowchart TD
         X -->|TaskArtifactUpdateEvent| T
     end
 
+    subgraph CHAT[채팅 SSE]
+        G["테넌트 가드\n(JWT 검증)"] --> S["POST /chat/stream"]
+        S --> X
+        X -->|토큰·done| R["런 레지스트리"]
+        R -->|스냅샷 + 실시간| A["POST /chat/stream/attach"]
+        R --> CH
+        K["POST /chat/stop"] -->|취소| X
+    end
+
     classDef db fill=#f2f2f2,stroke=#333,stroke-width=1px;
 ```
 
 - **todolist**: 각 작업(Task)의 진행 상태, 결과물 저장  
 - **events**: 실행 중간에 발생한 이벤트 로그 저장  
-- SDK는 두 테이블을 자동으로 연결해 줍니다.  
+- **chats**: 채팅 턴의 최종 응답 저장  
+- SDK는 세 테이블을 자동으로 연결해 줍니다.  
+- 채팅 경로는 요청이 Executor 에 닿기 전에 테넌트를 검증하고, 턴이 내보내는
+  이벤트를 런 레지스트리에 남겨 재접속·중지가 가능하게 합니다.  
 
 ---
 
@@ -165,6 +189,7 @@ await event_queue.enqueue_event(evt_end)
 
 - **프로세스(폴링)**: `await server.run()`로 DB에서 todo를 가져와 처리
 - **채팅(SSE)**: `/chat/stream` 엔드포인트로 요청을 받아 `Message-only`로 응답 + `chats`에 저장
+- **채팅 부가 라우트**: `/chat/stream/attach`(재접속) · `/chat/stop`(중지)
 
 ### 4.1 서버 구성 예시 (폴링 + SSE 함께)
 
@@ -182,10 +207,14 @@ async def main():
     server = ProcessGPTAgentServer(
         agent_executor=MyExecutor(),
         agent_type="langchain-react",
+        # 요청 본문의 tenant_id 를 요청자의 JWT 로 검증한다(기본값). 4.6 참고.
+        tenant_auth=True,
     )
 
     app = Starlette()
-    server.mount_chat_sse(app, path="/chat/stream")
+    # /chat/stream · /chat/stream/attach · /chat/stop 을 한 번에 붙이고,
+    # tenant_auth 가 켜져 있으면 스트림 경로에 검증 미들웨어도 건다.
+    server.mount_chat_routes(app)
 
     uvicorn_server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=8010, log_level="info")
@@ -200,6 +229,10 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+> 스트림 하나만 필요하면 `mount_chat_sse(app, path="/chat/stream")` 를 그대로 쓸 수
+> 있습니다(하트비트와 런 레지스트리는 이 경로에도 적용됩니다). 다만 재접속·중지
+> 라우트와 테넌트 검증 미들웨어는 `mount_chat_routes()` 만 붙여 줍니다.
 
 ### 4.2 Executor 구현 예시 (A2A 표준만 사용)
 
@@ -310,10 +343,15 @@ class MyExecutor(...):
 ```bash
 curl -N -X POST http://127.0.0.1:8010/chat/stream \
   -H 'content-type: application/json' \
-  -d '{"message":"hello","conversation_id":"conv-1","tenant_id":"","user_uid":"u1"}'
+  -H 'authorization: Bearer <supabase-jwt>' \
+  -d '{"message":"hello","conversation_id":"conv-1","tenant_id":"t1","user_uid":"u1"}'
 ```
 
-### 4.4 설치(옵션: SSE)
+`tenant_auth=True`(기본값) 면 `Authorization: Bearer …` 가 필요합니다. 토큰이 없으면
+401, 본문의 `tenant_id` 가 그 사용자의 소속이 아니면 403 입니다. 본문에 `tenant_id` 를
+넣지 않으면 검증된 값이 자동으로 채워집니다. 하위호환으로 본문 `user_jwt` 도 받습니다.
+
+### 4.4 설치(옵션: SSE, 인증)
 
 채팅(SSE)을 포함해 사용하려면 extras가 필요합니다.
 
@@ -321,7 +359,139 @@ curl -N -X POST http://127.0.0.1:8010/chat/stream \
 pip install "process-gpt-agent-sdk[sse]"
 ```
 
+테넌트 인증까지 쓰려면 JWT 검증용 extras를 함께 설치합니다.
+
+```bash
+pip install "process-gpt-agent-sdk[sse,auth]"
+```
+
+| extras | 들어오는 것 | 언제 필요한가 |
+|---|---|---|
+| `sse` | starlette, uvicorn | 채팅 라우트를 마운트할 때 |
+| `auth` | pyjwt[crypto] | `tenant_auth=True` 로 둘 때 |
+
+`auth` 는 함수 안에서 import 하므로, 인증을 끈 서버는 설치하지 않아도 기동에 영향이
+없습니다(검증을 실제로 시도하는 순간 설치 안내와 함께 500 이 납니다).
+
 참고로, 레포에는 빠르게 확인할 수 있는 샘플(`sample_server/minimal_server.py`, `sample_server/minimal_executor.py`)도 포함되어 있습니다.
+
+### 4.5 채팅 전송 계층 (하트비트 · 재접속 · 중지)
+
+`mount_chat_routes()` 를 쓰면 아래 세 가지가 자동으로 따라옵니다. Executor 는 바뀌지
+않습니다 — 지금까지처럼 A2A 이벤트만 emit 하면 됩니다.
+
+| 기능 | 무엇을 해결하나 |
+|---|---|
+| **하트비트** | 한 턴은 LLM 이 오래 생각하는 동안 수 분씩 아무 이벤트도 내보내지 않는다. 중간 프록시(Cloudflare 등)가 유휴 커넥션을 100초 안팎에서 끊으면 백엔드는 계속 도는데 화면만 "생각 중…" 에서 멈춘다. 15초마다 SSE 주석(`: keep-alive`)을 끼워 커넥션을 살려 둔다. 주석이라 프론트 파서(`data:` 만 처리)는 무시한다. |
+| **재접속** | 새로고침하거나 방을 다시 열면 진행 중인 턴의 결과를 영영 못 받았다. `/chat/stream/attach` 가 지금까지 쌓인 본문을 `snapshot` 1건으로 주고 이후 토큰을 실시간으로 잇는다. |
+| **중지** | 프론트의 중지 버튼은 자기 쪽 `fetch` 만 끊을 뿐이라 서버 실행은 계속 돌며 토큰·도구 호출을 그대로 소비했다. `/chat/stop` 이 실행 task 를 실제로 취소한다. |
+
+여기에 더해, **같은 방에 새 턴이 들어오면 이전 턴을 먼저 끊습니다**. 프론트가 로딩 중
+새 메시지를 보낼 때 서버에는 취소 신호를 주지 않아, 이게 없으면 같은
+`conversation_id` 에 두 실행이 겹칩니다.
+
+**재접속 요청**
+
+```bash
+curl -N -X POST http://127.0.0.1:8010/chat/stream/attach \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer <supabase-jwt>' \
+  -d '{"conversation_id":"conv-1","tenant_id":"t1"}'
+```
+
+활성 턴이 있으면 `text/event-stream` 으로 응답합니다.
+
+```
+event: message
+data: {"type": "snapshot", "content": "지금까지 쓴 본문"}
+
+event: message
+data: {"type": "token", "content": "이어서"}
+```
+
+활성 턴이 없으면 SSE 가 아니라 **`200 {"active": false}`** 입니다. 404 가 아닌 이유는,
+첫 attach 시도는 항상 "아직 스트림 없음" 이라 404 로 두면 메시지를 보낼 때마다 브라우저
+네트워크 탭에 실패 요청이 쌓이기 때문입니다. 프론트는 `content-type` 이
+`text/event-stream` 이 아니면 조용히 종료하면 됩니다.
+
+**중지 요청**
+
+```bash
+curl -X POST http://127.0.0.1:8010/chat/stop \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer <supabase-jwt>' \
+  -d '{"conversation_id":"conv-1","tenant_id":"t1"}'
+```
+
+| 응답 | 의미 |
+|---|---|
+| `{"stopped": true}` | 진행 중이던 턴을 취소했다 |
+| `{"stopped": false, "reason": "no_active_turn"}` | 취소할 실행이 없다(이미 끝났거나 HITL 대기 중) |
+| `403 {"stopped": false, "reason": "forbidden"}` | 요청자의 테넌트와 방 소유 테넌트가 다르다 |
+
+재접속·중지 모두 **방 소유 테넌트(`chat_rooms.tenant_id`)와 요청자의 테넌트가 같을 때만**
+동작합니다. 방을 조회하지 못하면 거부합니다(fail-closed).
+
+**하트비트 주기**는 `SSE_HEARTBEAT_SECONDS` 환경변수로 바꿉니다(기본 15초).
+
+### 4.6 테넌트 인증
+
+채팅 요청의 `tenant_id` 는 Executor 를 지나 스킬 디렉터리 로드·샌드박스 마운트·작업공간
+경로까지 그대로 흘러갑니다. 검증하지 않으면 값만 바꿔 호출해 남의 테넌트 자원에 닿을 수
+있습니다. 그래서 `tenant_auth` 의 기본값은 **켜짐**입니다.
+
+```python
+server = ProcessGPTAgentServer(
+    agent_executor=MyExecutor(),
+    agent_type="crewai-action",
+    tenant_auth=True,   # 기본값
+)
+server.mount_chat_routes(app)
+```
+
+검증 경로는 토큰 헤더의 `alg` 에 따라 갈립니다.
+
+1. **비대칭**(ES256/RS256 …) — Supabase JWKS(`/auth/v1/.well-known/jwks.json`) 로컬 검증.
+   최신 Supabase 프로젝트(JWT signing keys)가 여기 해당합니다.
+2. **HS256 + `SUPABASE_JWT_SECRET`** — 레거시 대칭키 프로젝트·커스텀 SSO 토큰 로컬 검증.
+3. 둘 다 불가하면 **GoTrue `/auth/v1/user`** 에 위임.
+
+소속 테넌트는 JWT 클레임(`tenant_id` / `app_metadata.tenant_id` / `tenant_ids`)을 먼저
+보고, 없으면 `users` 테이블에서 조회합니다(멀티 테넌트 소속 대응). 검증 결과는 토큰
+단위로 60초 캐시하고, 토큰 만료가 더 이르면 그 시점까지만 캐시합니다.
+
+| 환경변수 | 쓰임 |
+|---|---|
+| `SUPABASE_URL` | JWKS 주소를 만든다(비대칭 검증) |
+| `SUPABASE_JWT_SECRET` | HS256 대칭키 검증(있을 때만) |
+
+**판정 규칙**
+
+| 상황 | 결과 |
+|---|---|
+| 토큰 없음 | 401 |
+| 요청한 `tenant_id` 가 소속이 아님 | 403 |
+| 요청에 `tenant_id` 없고 소속이 하나 | 그 값으로 채워 통과 |
+| 요청에 `tenant_id` 없고 소속이 여럿 | 400 (`tenant_id is required`) |
+| 소속 테넌트가 하나도 없음 | 403 |
+
+직접 만든 라우트에도 같은 규칙을 걸 수 있습니다.
+
+```python
+from processgpt_agent_sdk import tenant_guard, request_tenant_id
+
+@tenant_guard
+async def my_handler(request):
+    # 요청이 보낸 값이 아니라 검증된 값만 쓴다
+    tenant_id = request_tenant_id(request)
+    ...
+```
+
+테넌트 스코프가 없는 엔드포인트는 `auth_guard` 로 인증만 확인합니다.
+
+> **끄는 경우**: 앞단에 별도 인증 게이트웨이가 있거나 로컬 개발일 때만
+> `tenant_auth=False` 로 둡니다. 이때는 기동 로그에 경고가 남고, 요청 본문의
+> `tenant_id` 가 그대로 Executor 에 전달됩니다.
 
 ---
 
@@ -352,6 +522,7 @@ pip install "process-gpt-agent-sdk[sse]"
 - 공통 이벤트 흐름: `Task` → `TaskStatusUpdateEvent[..]` → `TaskArtifactUpdateEvent(last_chunk=True)`
 - **프로세스(폴링) 경로**: `ProcessEventQueue`가 status는 events 테이블, artifact는 todolist 테이블에 저장
 - **채팅(SSE) 경로**: `ChatEventQueue`가 status는 SSE message 청크로, 최종 artifact는 SSE done + chats 테이블 저장으로 변환
+- **전송 계층**: 하트비트·재접속·중지·테넌트 검증은 프레임워크가 처리합니다. Executor 는 이들을 알 필요가 없습니다 (4.5 · 4.6)
 
 ### 6.1 프로세스(폴링)만 실행
 
@@ -367,7 +538,7 @@ await server.run()
 SSE를 쓰려면 extras 설치가 필요합니다.
 
 ```bash
-pip install "process-gpt-agent-sdk[sse]"
+pip install "process-gpt-agent-sdk[sse,auth]"
 ```
 
 ```python
@@ -377,8 +548,25 @@ from processgpt_agent_sdk import ProcessGPTAgentServer
 
 server = ProcessGPTAgentServer(agent_executor=MyExecutor(), agent_type="crewai-action")
 app = Starlette()
-server.mount_chat_sse(app, path="/chat/stream")  # POST /chat/stream
+server.mount_chat_routes(app)
+# POST /chat/stream · /chat/stream/attach · /chat/stop
 ```
+
+경로를 바꾸거나 일부만 붙일 수도 있습니다. 예전 프론트가 쓰던 별칭 경로가 있으면
+`stream_paths` 에 함께 넘깁니다.
+
+```python
+server.mount_chat_routes(
+    app,
+    stream_paths=("/chat/stream", "/{agent_id}/chat/stream"),
+    attach_path="/chat/stream/attach",   # None 이면 붙이지 않는다
+    stop_path="/chat/stop",              # None 이면 붙이지 않는다
+)
+```
+
+FastAPI 앱에도 그대로 넘길 수 있습니다. 라우트는 항상 Starlette 라우트로 등록되는데,
+FastAPI 의 `add_api_route()` 에 넘기면 핸들러 시그니처(타입 주석 없는 `request`)를 필수
+쿼리 파라미터로 해석해 모든 요청이 422 로 떨어지기 때문입니다.
 
 요청 바디 예시:
 
@@ -414,7 +602,7 @@ async def main():
     server = ProcessGPTAgentServer(agent_executor=MyExecutor(), agent_type="crewai-action")
 
     app = Starlette()
-    server.mount_chat_sse(app, path="/chat/stream")
+    server.mount_chat_routes(app)
 
     uvicorn_server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=8010, log_level="info")
@@ -432,6 +620,34 @@ if __name__ == "__main__":
 
 운영 환경에서는 **폴링 프로세스**와 **HTTP API 프로세스**를 분리 운영하는 경우도 많습니다.
 
+### 6.4 다중 파드 배포 (레지스트리 교체)
+
+재접속·중지 레지스트리의 기본 구현은 **프로세스 로컬 dict** 입니다(단일 uvicorn 워커
+전제). 파드를 여러 개 띄우면 "A 파드가 돌리는 턴에 B 파드가 받은 attach 요청" 이
+맞지 않으므로, 공유 백엔드 구현으로 갈아끼웁니다. SDK 는 계약만 소유하고 공유 상태
+백엔드는 애플리케이션이 고릅니다.
+
+```python
+from processgpt_agent_sdk import (
+    ChatRunRegistry,
+    set_run_registry,
+    set_inflight_registry,
+)
+
+class RedisRunRegistry(ChatRunRegistry):
+    async def start_run(self, conversation_id): ...
+    async def record(self, conversation_id, payload): ...
+    async def mark_done(self, conversation_id): ...
+    async def subscribe(self, conversation_id): ...
+    async def unsubscribe(self, conversation_id, q): ...
+
+set_run_registry(RedisRunRegistry())
+```
+
+`asyncio.Task.cancel()` 은 그 task 를 만든 프로세스 안에서만 가능하므로, 중지의 경우
+공유 백엔드는 "이 방을 어느 파드가 들고 있는지" 소유권 기록과 취소 신호 전달에만 쓰고
+취소 자체는 항상 소유 파드에서 일어나야 합니다.
+
 ## 7. 버전업
 - ./release.sh 버전
 - 오류 발생시 : python -m ensurepip --upgrade
@@ -441,3 +657,15 @@ if __name__ == "__main__":
 - 기존 `processgpt_agent_sdk.utils.upload_file_to_bucket`, `upload_files_to_bucket` 는 하위호환용으로 유지되지만 deprecated 입니다.
 - 신규 코드는 아래 경로를 사용하세요:
   - `from processgpt_agent_sdk.integrations.storage import upload_file_to_bucket, upload_files_to_bucket`
+
+### 8.1 채팅 전송 계층 모듈 (0.5.0 추가)
+
+| 모듈 | 들어 있는 것 |
+|---|---|
+| `processgpt_agent_sdk.tenant_auth` | `authorize_tenant`, `tenant_guard`, `auth_guard`, `request_tenant_id`, `ChatTenantGuardMiddleware`, `TenantAuthError` |
+| `processgpt_agent_sdk.chat_registry` | `ChatRunRegistry`, `InflightRegistry`, `set_run_registry`, `set_inflight_registry` |
+| `processgpt_agent_sdk.chat_sse` | `with_heartbeat`, `apply_heartbeat`, `format_sse_message`, `make_attach_handler`, `make_stop_handler` |
+
+셋 다 최상위(`from processgpt_agent_sdk import ...`)로도 노출됩니다. 대부분의 경우
+`mount_chat_routes()` 하나면 충분하고, 이 모듈들은 라우트를 직접 조립하거나 레지스트리를
+교체할 때만 씁니다.

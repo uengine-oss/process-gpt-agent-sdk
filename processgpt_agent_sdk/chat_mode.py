@@ -137,6 +137,15 @@ class ChatRequestContext(RequestContext):
     def get_context_data(self) -> Dict[str, Any]:
         return {"row": self._row, "extras": self._extras}
 
+    def set_streamer(self, streamer: Optional["ChatStreamer"]) -> None:
+        """컨텍스트 생성 후에 스트리머를 붙인다.
+
+        스트리머가 쓰는 출력 큐는 `context_id`(=conversation_id) 를 알아야 만들 수
+        있는데, 그 값은 이 컨텍스트가 정한다(요청에 conversation_id 가 없으면 새로
+        발급). 그래서 컨텍스트를 먼저 만들고 스트리머를 나중에 꽂는 경로가 필요하다.
+        """
+        self._extras["streamer"] = streamer
+
     @property
     def metadata(self) -> Dict[str, Any]:
         """A2A 표준 metadata 접근자.
