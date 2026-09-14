@@ -172,8 +172,22 @@ class InflightRegistry:
             return None
         return task
 
+    async def supersede(self, conversation_id: str) -> bool:
+        """새 턴이 시작될 때, 같은 방에 남아 있는 이전 턴을 정리한다.
+
+        `cancel()` 과 분리해 둔 이유: 새 요청이 이전 응답을 **대체**하는 경우와
+        **이어가는** 경우가 다르다. 대표적으로 HITL(사람 확인) 응답은 이전 턴이
+        남긴 interrupt 를 재개하는 것이라, 그 턴을 취소하면 체크포인트가 사라져
+        재개가 불가능해진다. 어느 쪽인지는 요청 본문을 해석해야 알 수 있고 그건
+        Executor 의 몫이므로, 그런 서버는 이 메서드를 no-op 으로 재정의하고
+        Executor 안에서 직접 판단한다.
+
+        기본 동작은 취소다 — 대부분의 에이전트에서 새 요청은 대체를 뜻한다.
+        """
+        return await self.cancel(conversation_id)
+
     async def cancel(self, conversation_id: str) -> bool:
-        """진행 중인 턴을 취소한다. 취소할 것이 있었으면 True."""
+        """진행 중인 턴을 취소한다(명시적 중지). 취소할 것이 있었으면 True."""
         task = self.get_inflight(conversation_id)
         if task is None:
             return False

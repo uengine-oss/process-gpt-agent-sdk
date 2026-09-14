@@ -515,10 +515,12 @@ class ProcessGPTAgentServer:
             ctx = ChatRequestContext(req, streamer=None)
             conversation_id = ctx.context_id
 
-            # 이 방에서 이미 돌고 있는 턴이 있으면 먼저 끊는다. 프론트는 로딩 중
+            # 이 방에서 이미 돌고 있는 턴이 있으면 먼저 정리한다. 프론트는 로딩 중
             # 새 메시지를 보낼 때 자기 쪽 fetch 만 끊고 서버에는 취소 신호를 주지
             # 않으므로, 이게 없으면 같은 방에 두 실행이 겹친다.
-            await get_inflight_registry().cancel(conversation_id)
+            # cancel() 이 아니라 supersede() 인 이유는 chat_registry 참고 — 새 요청이
+            # 이전 턴을 대체하는지 이어가는지(HITL)는 서버마다 다르다.
+            await get_inflight_registry().supersede(conversation_id)
 
             # 큐 한 곳만 가로채면 ChatStreamer(토큰)와 ChatEventQueue(done)가 내보내는
             # 이벤트 전부가 레지스트리에 남는다 — 재접속한 클라이언트가 받는 것과

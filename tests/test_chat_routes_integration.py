@@ -155,6 +155,28 @@ class TestMountChatRoutes(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first_task.cancelled())
         self.assertIsNot(self.inflight.get_inflight(ROOM), first_task)
 
+    async def test_supersede_를_막으면_이전_턴이_살아_있다(self):
+        """HITL 응답처럼 이전 턴을 이어가야 하는 서버는 supersede 를 재정의한다."""
+
+        class KeepPrevious(InflightRegistry):
+            async def supersede(self, conversation_id):
+                return False   # 새 턴이 와도 이전 턴을 끊지 않는다
+
+        keeper = KeepPrevious()
+        set_inflight_registry(keeper)
+        self.inflight = keeper
+
+        await self._start_turn()
+        first_task = keeper.get_inflight(ROOM)
+
+        self.executor.streamed.clear()
+        await self._start_turn()
+
+        self.assertFalse(first_task.cancelled())
+        # 명시적 중지는 그대로 동작해야 한다.
+        self.assertTrue(await keeper.cancel(ROOM))
+        first_task.cancel()
+
     async def test_스트림_응답에_하트비트_헤더가_붙는다(self):
         response = await self._start_turn()
         self.assertEqual(response.headers.get("cache-control"), "no-cache")

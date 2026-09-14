@@ -648,6 +648,29 @@ set_run_registry(RedisRunRegistry())
 공유 백엔드는 "이 방을 어느 파드가 들고 있는지" 소유권 기록과 취소 신호 전달에만 쓰고
 취소 자체는 항상 소유 파드에서 일어나야 합니다.
 
+**supersede 와 cancel 은 다릅니다.** `InflightRegistry` 는 두 메서드를 따로 둡니다.
+
+| 메서드 | 언제 불리나 | 기본 동작 |
+|---|---|---|
+| `supersede(cid)` | 같은 방에 새 턴이 시작될 때 | `cancel()` 을 부른다 |
+| `cancel(cid)` | `/chat/stop` 으로 명시적 중지할 때 | 실행 task 를 취소한다 |
+
+새 요청이 이전 응답을 **대체**하는지 **이어가는지**는 서버마다 다릅니다. 대표적으로
+HITL(사람 확인) 응답은 이전 턴이 남긴 interrupt 를 재개하는 것이라, 그 턴을 취소하면
+체크포인트가 사라져 재개가 불가능해집니다. 어느 쪽인지는 요청 본문을 해석해야 알 수
+있고 그건 Executor 의 몫이므로, 그런 서버는 `supersede()` 를 no-op 으로 재정의하고
+Executor 안에서 직접 판단합니다.
+
+```python
+from processgpt_agent_sdk import InflightRegistry, set_inflight_registry
+
+class ExecutorDecides(InflightRegistry):
+    async def supersede(self, conversation_id):
+        return False   # 대체/이어가기 판단은 Executor 가 한다
+
+set_inflight_registry(ExecutorDecides())
+```
+
 ## 7. 버전업
 - ./release.sh 버전
 - 오류 발생시 : python -m ensurepip --upgrade
