@@ -643,6 +643,9 @@ async def fetch_chat_room_tenant_id(conversation_id: str) -> str:
 
     def _query() -> str:
         try:
+            # attach/stop 은 SDK 채팅 핸들러를 거치지 않고 곧바로 들어오므로,
+            # 이 경로에서도 초기화를 보장한다(멱등).
+            initialize_db()
             client = get_db_client()
             resp = (
                 client.table("chat_rooms")

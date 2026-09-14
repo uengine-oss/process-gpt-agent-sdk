@@ -206,9 +206,12 @@ def _verify_with_secret(token: str, secret: str) -> dict:
 
 def _verify_with_gotrue(token: str) -> dict:
     """대칭키 시크릿이 없을 때 GoTrue 에 검증을 위임한다(서명·만료 모두 서버가 확인)."""
-    from .database import get_db_client
+    from .database import get_db_client, initialize_db
 
     try:
+        # 가드는 미들웨어라 채팅 핸들러의 initialize_db() 보다 먼저 돈다.
+        # 여기서 직접 챙기지 않으면 첫 요청이 "DB 미초기화" 로 떨어진다(멱등).
+        initialize_db()
         resp = get_db_client().auth.get_user(token)
     except Exception as e:
         raise TenantAuthError(f"토큰 검증 실패: {e}") from e
@@ -286,8 +289,12 @@ def _tenants_from_db(user_id: str) -> frozenset:
 
     tenants: set = set()
     try:
-        from .database import get_db_client
+        from .database import get_db_client, initialize_db
 
+        # _verify_with_gotrue 와 같은 이유로 여기서도 초기화를 보장한다. 이 조회가
+        # 실패하면 아래에서 "소속 없음"(fail-closed)으로 떨어져 정상 사용자가 403 을
+        # 받게 되므로, 초기화 누락이 조용한 인가 실패로 번지지 않게 막는다.
+        initialize_db()
         resp = get_db_client().table("users").select("tenant_id").eq("id", user_id).execute()
         for row in getattr(resp, "data", None) or []:
             tid = str((row or {}).get("tenant_id") or "").strip()
