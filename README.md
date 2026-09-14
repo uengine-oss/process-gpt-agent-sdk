@@ -23,32 +23,31 @@
 ## 2. 아키텍처 다이어그램
 ```mermaid
 flowchart TD
-    subgraph DB[Postgres/Supabase]
-        T[todolist]:::db
-        E[events]:::db
+    subgraph DB["Postgres / Supabase"]
+        T["todolist"]:::db
+        E["events"]:::db
+        CH["chats"]:::db
     end
 
-    subgraph DB2[Postgres/Supabase]
-        CH[chats]:::db
+    subgraph SDK["SDK — 프로세스(폴링)"]
+        P["Polling<br/>(fetch_pending_task)"] --> C["Context 준비<br/>(fetch_context_bundle 등)"]
+        C --> X["Executor<br/>(MinimalExecutor)"]
     end
 
-    subgraph SDK
-        P[Polling\n(fetch_pending_task)] --> C[Context 준비\n(fetch_context_bundle 등)]
-        C --> X[Executor\n(MinimalExecutor)]
-        X -->|TaskStatusUpdateEvent| E
-        X -->|TaskArtifactUpdateEvent| T
+    subgraph CHAT["SDK — 채팅(SSE)"]
+        G["테넌트 가드<br/>(JWT 검증)"] --> S["POST /chat/stream"]
+        R["런 레지스트리"] --> A["POST /chat/stream/attach"]
+        K["POST /chat/stop"]
     end
 
-    subgraph CHAT[채팅 SSE]
-        G["테넌트 가드\n(JWT 검증)"] --> S["POST /chat/stream"]
-        S --> X
-        X -->|토큰·done| R["런 레지스트리"]
-        R -->|스냅샷 + 실시간| A["POST /chat/stream/attach"]
-        R --> CH
-        K["POST /chat/stop"] -->|취소| X
-    end
+    S --> X
+    K -->|취소| X
+    X -->|TaskStatusUpdateEvent| E
+    X -->|TaskArtifactUpdateEvent| T
+    X -->|토큰·done| R
+    R --> CH
 
-    classDef db fill=#f2f2f2,stroke=#333,stroke-width=1px;
+    classDef db fill:#f2f2f2,stroke:#333,stroke-width:1px;
 ```
 
 - **todolist**: 각 작업(Task)의 진행 상태, 결과물 저장  
