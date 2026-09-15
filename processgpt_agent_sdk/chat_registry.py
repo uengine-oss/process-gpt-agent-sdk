@@ -23,13 +23,19 @@
     conversation_id 별 실행 task 를 들고 있다가 중지 요청에 취소한다.
     `asyncio.Task.cancel()` 은 그 task 를 만든 프로세스 안에서만 가능하다.
 
+    새 턴이 시작될 때 이전 턴을 어떻게 할지는 두 갈래다 — `supersede()` 로 끊거나,
+    `wait_for_previous()` 로 끝나기를 기다리거나. 어느 쪽인지는 Executor 가
+    `should_supersede()` 로 알린다(`processgpt_agent_framework.mount_chat_sse` 참고).
+
 ## 다중 파드
 
-기본 구현은 프로세스 로컬 dict 다(단일 워커 전제). 여러 파드에 띄우는 배포는
-Redis 등으로 공유하는 구현을 만들어 `set_run_registry()` /
-`set_inflight_registry()` 로 갈아끼운다 — SDK 는 계약만 소유하고 공유 상태
-백엔드는 애플리케이션이 고른다. deepagents 의 Redis Streams 구현이 그대로
-이 자리에 들어간다.
+기본 구현은 프로세스 로컬 dict 다. 한 `conversation_id` 의 요청이 항상 같은
+프로세스로 오는 배포(세션당 파드 + thread_id 라우팅)에서는 이게 정확한 구현이다 —
+공유 상태가 필요 없고, 취소는 정의상 같은 프로세스 안에서 일어난다.
+
+요청이 아무 파드에나 떨어지는 배포에서는 Redis 등으로 공유하는 구현을 만들어
+`set_run_registry()` / `set_inflight_registry()` 로 갈아끼운다 — SDK 는 계약만
+소유하고 공유 상태 백엔드는 애플리케이션이 고른다.
 """
 
 from __future__ import annotations
@@ -49,6 +55,12 @@ GRACE_PERIOD_SECONDS = 30.0
 MAX_RUN_AGE_SECONDS = 30 * 60
 
 DONE_TYPES = ("done", "error")
+
+# 이전 턴을 취소하지 않고 기다릴 때의 상한. HITL 응답이 대표적인 경우인데, 프론트는
+# request_human_input **도구 호출 이벤트** 시점에 이미 패널을 그리므로 사용자가 곧바로
+# 답하면 이전 턴은 아직 LLM/도구를 돌리는 중일 수 있다. 그 턴이 interrupt 를 체크포인트에
+# 남겨야 재개가 되므로 넉넉히 기다린다.
+WAIT_PREVIOUS_TIMEOUT_SECONDS = 180.0
 
 
 @dataclass
@@ -186,6 +198,37 @@ class InflightRegistry:
         """
         return await self.cancel(conversation_id)
 
+    async def wait_for_previous(
+        self, conversation_id: str, *, timeout: float = WAIT_PREVIOUS_TIMEOUT_SECONDS
+    ) -> bool:
+        """이전 턴을 **취소하지 않고** 끝나기를 기다린다. 기다린 턴이 있었으면 True.
+
+        `supersede()` 와 짝이다. 새 요청이 이전 턴을 대체하는 게 아니라 이어가는
+        경우(HITL 응답)에 쓴다 — 취소하면 interrupt 체크포인트가 사라져 재개가
+        불가능해지고, 기다리지 않으면 두 실행이 같은 체크포인트를 동시에 쓴다.
+
+        타임아웃은 실패가 아니다. 이전 턴이 비정상적으로 오래 걸리는 경우까지
+        새 요청을 영원히 막는 것보다, 로그를 남기고 진행하는 편이 낫다.
+        """
+        task = self.get_inflight(conversation_id)
+        if task is None:
+            return False
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "이전 턴이 %.0f초 안에 끝나지 않아 기다리기를 멈춘다 | conversation_id=%s",
+                timeout, conversation_id,
+            )
+        except asyncio.CancelledError:
+            # 기다리는 동안 그 턴이 취소됐다 — 기다리던 목적(겹치지 않기)은 달성됐다.
+            pass
+        except Exception:
+            logger.debug(
+                "이전 턴이 예외로 종료 | conversation_id=%s", conversation_id, exc_info=True
+            )
+        return True
+
     async def cancel(self, conversation_id: str) -> bool:
         """진행 중인 턴을 취소한다(명시적 중지). 취소할 것이 있었으면 True."""
         task = self.get_inflight(conversation_id)
@@ -201,6 +244,19 @@ class InflightRegistry:
             logger.debug("inflight 턴이 예외로 종료 | conversation_id=%s", conversation_id, exc_info=True)
         self._tasks.pop(conversation_id, None)
         return True
+
+    def active_conversation_ids(self) -> List[str]:
+        """지금 턴이 돌고 있는 conversation_id 목록.
+
+        세션당 파드 배포에서 리버스 프록시가 TTL 회수 여부를 판정하는 근거다 —
+        유휴 시간이 지났어도 턴이 돌고 있는 파드는 죽이면 안 된다. 한 턴은 LLM 이
+        생각하거나 도구 하나가 도는 동안 유휴 한도보다 훨씬 오래 걸릴 수 있다.
+        """
+        return [cid for cid, task in list(self._tasks.items()) if not task.done()]
+
+    def busy(self) -> bool:
+        """턴이 하나라도 돌고 있으면 True."""
+        return bool(self.active_conversation_ids())
 
     def _clear_if(self, conversation_id: str, task: asyncio.Task) -> None:
         if self._tasks.get(conversation_id) is task:

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import json
 import os
@@ -38,6 +39,7 @@ from .chat_sse import (
     add_route as _add_route,
     apply_heartbeat,
     make_attach_handler,
+    make_health_handler,
     make_stop_handler,
 )
 from .tenant_auth import ChatTenantGuardMiddleware
@@ -459,6 +461,35 @@ class ProcessGPTAgentServer:
         self._shutdown_event.set()
         logger.info("ProcessGPT Agent Server stopping...")
 
+    async def _should_supersede(self, ctx: Any) -> bool:
+        """새 턴이 이전 턴을 **대체**하는가(True) **이어가는가**(False).
+
+        Executor 가 선택적으로 `should_supersede(context)` 를 구현하면 그 판단을
+        쓴다(동기/비동기 모두 허용). 없으면 True — 대부분의 에이전트에서 새 요청은
+        이전 응답을 대체한다.
+
+        대표적인 False 는 HITL(사람 확인) 응답이다. 프론트는 백엔드가 interrupt 를
+        다 처리하기 전에 이미 확인 패널을 그리므로, 사용자가 곧바로 승인하면 이전
+        턴이 아직 돌고 있다. 그걸 취소하면 interrupt 체크포인트가 남지 않아 재개가
+        불가능해진다.
+
+        훅이 예외를 내면 기존 동작(대체)을 쓴다 — 판단을 못 했다고 요청을 실패시키는
+        것보다 낫고, 그 편이 이 훅이 없던 시절과 같다.
+        """
+        hook = getattr(self.agent_executor, "should_supersede", None)
+        if hook is None:
+            return True
+        try:
+            result = hook(ctx)
+            if inspect.isawaitable(result):
+                result = await result
+            return bool(result)
+        except Exception:
+            logger.warning(
+                "should_supersede() 가 실패해 기본값(대체)으로 진행합니다", exc_info=True
+            )
+            return True
+
     def mount_chat_sse(self, app: Any, *, path: str = "/chat/stream"):
         """Starlette/FastAPI 앱에 채팅 SSE 엔드포인트를 마운트합니다.
 
@@ -518,9 +549,14 @@ class ProcessGPTAgentServer:
             # 이 방에서 이미 돌고 있는 턴이 있으면 먼저 정리한다. 프론트는 로딩 중
             # 새 메시지를 보낼 때 자기 쪽 fetch 만 끊고 서버에는 취소 신호를 주지
             # 않으므로, 이게 없으면 같은 방에 두 실행이 겹친다.
-            # cancel() 이 아니라 supersede() 인 이유는 chat_registry 참고 — 새 요청이
-            # 이전 턴을 대체하는지 이어가는지(HITL)는 서버마다 다르다.
-            await get_inflight_registry().supersede(conversation_id)
+            #
+            # 끊을지 기다릴지는 Executor 가 정한다 — 새 요청이 이전 턴을 대체하는지
+            # (보통) 이어가는지(HITL 응답)는 요청 본문을 해석해야 알 수 있고 그건
+            # Executor 의 몫이다. 훅이 없으면 대체로 본다.
+            if await self._should_supersede(ctx):
+                await get_inflight_registry().supersede(conversation_id)
+            else:
+                await get_inflight_registry().wait_for_previous(conversation_id)
 
             # 큐 한 곳만 가로채면 ChatStreamer(토큰)와 ChatEventQueue(done)가 내보내는
             # 이벤트 전부가 레지스트리에 남는다 — 재접속한 클라이언트가 받는 것과
@@ -577,6 +613,8 @@ class ProcessGPTAgentServer:
         stream_paths: tuple = ("/chat/stream",),
         attach_path: Optional[str] = "/chat/stream/attach",
         stop_path: Optional[str] = "/chat/stop",
+        health_path: Optional[str] = None,
+        health_extra: Optional[Any] = None,
     ):
         """채팅 SSE 라우트 한 벌을 통째로 마운트한다.
 
@@ -589,6 +627,10 @@ class ProcessGPTAgentServer:
                 `/{agent_id}/chat/stream` 같은 별칭을 함께 넘길 수 있다.
             attach_path: None 이면 재접속 라우트를 붙이지 않는다.
             stop_path: None 이면 중지 라우트를 붙이지 않는다.
+            health_path: 경로를 주면 `/health` 를 붙인다. 기본은 None — 이미 자기
+                `/health` 를 가진 서버가 많아서, 그 경우엔 이걸 켜는 대신
+                `get_inflight_registry().busy()` 를 자기 payload 에 넣으면 된다.
+            health_extra: 헬스 payload 에 얹을 필드를 주는 콜러블(동기/비동기).
         """
         for path in stream_paths:
             self.mount_chat_sse(app, path=path)
@@ -602,6 +644,11 @@ class ProcessGPTAgentServer:
             _add_route(
                 app, stop_path,
                 make_stop_handler(require_auth=self.tenant_auth), methods=["POST"],
+            )
+        if health_path:
+            _add_route(
+                app, health_path,
+                make_health_handler(extra=health_extra), methods=["GET"],
             )
 
         if self.tenant_auth:

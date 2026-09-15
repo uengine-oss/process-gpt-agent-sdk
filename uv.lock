@@ -1411,7 +1411,7 @@ wheels = [
 
 [[package]]
 name = "process-gpt-agent-sdk"
-version = "0.4.26"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "a2a-sdk" },
@@ -1424,6 +1424,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+auth = [
+    { name = "pyjwt", extra = ["crypto"] },
+]
 sse = [
     { name = "starlette" },
     { name = "uvicorn" },
@@ -1434,6 +1437,7 @@ requires-dist = [
     { name = "a2a-sdk", specifier = ">=1.0.0" },
     { name = "litellm" },
     { name = "pydantic", specifier = ">=2.0.0" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'auth'", specifier = ">=2.8.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "requests", specifier = ">=2.25.0" },
     { name = "starlette", marker = "extra == 'sse'", specifier = ">=0.48.0" },
@@ -1441,7 +1445,7 @@ requires-dist = [
     { name = "typing-extensions", specifier = ">=4.0.0" },
     { name = "uvicorn", marker = "extra == 'sse'", specifier = ">=0.30.0" },
 ]
-provides-extras = ["sse"]
+provides-extras = ["sse", "auth"]
 
 [[package]]
 name = "propcache"

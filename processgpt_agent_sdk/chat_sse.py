@@ -1,7 +1,7 @@
 """processgpt_agent_sdk/chat_sse.py — 채팅 SSE 전송 계층.
 
-하트비트, 재접속(`/chat/stream/attach`), 중지(`/chat/stop`) 를 담는다.
-세 가지 모두 codex 와 deepagents 가 각자 같은 것을 구현하고 있던 부분이다.
+하트비트, 재접속(`/chat/stream/attach`), 중지(`/chat/stop`), 헬스체크(`/health`) 를 담는다.
+앞의 세 가지는 codex 와 deepagents 가 각자 같은 것을 구현하고 있던 부분이다.
 
 ## 하트비트
 
@@ -207,6 +207,42 @@ def make_attach_handler(*, require_auth: bool = True, interval: Optional[float] 
         )
 
     return attach_handler
+
+
+def make_health_handler(*, extra: Optional[Any] = None):
+    """`/health` 핸들러를 만든다. 진행 중인 턴 여부를 함께 싣는다.
+
+    세션당 파드 배포에서 리버스 프록시는 유휴 TTL 이 지난 파드를 회수하는데, 턴이
+    도는 중인 파드를 죽이면 사용자의 대화가 그대로 끊긴다. 파드가 스스로 "지금
+    바쁘다"를 말해 주는 것이 프록시가 그 판단을 할 수 있는 유일한 근거다.
+
+    `extra` 는 애플리케이션이 얹을 필드를 주는 콜러블(동기/비동기 모두 허용)이다.
+    반환한 dict 가 기본 payload 위에 병합된다.
+    """
+    from starlette.responses import JSONResponse
+
+    async def health_handler(_request: Any) -> Any:
+        inflight = get_inflight_registry()
+        active = inflight.active_conversation_ids()
+        payload: dict = {
+            "status": "ok",
+            "busy": bool(active),
+            "active_turns": len(active),
+        }
+        if extra is not None:
+            try:
+                more = extra()
+                if asyncio.iscoroutine(more):
+                    more = await more
+                if isinstance(more, dict):
+                    payload.update(more)
+            except Exception:
+                # 부가 정보를 못 구한다고 헬스체크를 실패시키면 파드가 통째로
+                # NotReady 가 된다 — 프록시에는 busy 만 정확하면 된다.
+                logger.warning("health: extra 수집 실패(무시)", exc_info=True)
+        return JSONResponse(payload)
+
+    return health_handler
 
 
 def make_stop_handler(*, require_auth: bool = True):

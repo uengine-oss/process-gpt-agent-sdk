@@ -39,6 +39,7 @@ from .chat_sse import (
     apply_heartbeat,
     format_sse_message,
     make_attach_handler,
+    make_health_handler,
     make_stop_handler,
 )
 from .tenant_auth import (
@@ -81,6 +82,7 @@ __all__ = [
     "apply_heartbeat",
     "format_sse_message",
     "make_attach_handler",
+    "make_health_handler",
     "make_stop_handler",
     # 테넌트 인증
     "ChatTenantGuardMiddleware",
