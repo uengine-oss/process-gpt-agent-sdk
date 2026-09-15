@@ -54,6 +54,14 @@ from .tenant_auth import (
     tenant_guard,
     verify_token,
 )
+from .session import (
+    SESSION_BUCKET,
+    SESSION_TABLE,
+    AgentSessionStore,
+    ArchivePart,
+    SessionArchive,
+    session_prefix,
+)
 from .integrations.storage import upload_file_to_bucket, upload_files_to_bucket
 from .single_run import run_single_todo_readonly
 
@@ -110,6 +118,13 @@ __all__ = [
     "fetch_chat_room_tenant_id",
     "summarize_error_to_user",
     "summarize_feedback",
+    # 대화가 파드보다 오래 살게 하는 것들
+    "AgentSessionStore",
+    "SessionArchive",
+    "ArchivePart",
+    "SESSION_TABLE",
+    "SESSION_BUCKET",
+    "session_prefix",
     "upload_file_to_bucket",
     "upload_files_to_bucket",
     "run_single_todo_readonly",
