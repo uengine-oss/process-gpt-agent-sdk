@@ -74,6 +74,21 @@ def _to_jsonable(value: Any) -> Any:
 # ------------------------------ DB Client ------------------------------
 _supabase_client: Optional[Client] = None
 
+SUPABASE_KEY_ENV_VARS = ("SERVICE_ROLE_KEY", "SUPABASE_KEY", "SUPABASE_ANON_KEY")
+
+
+def _read_supabase_key() -> tuple[Optional[str], str]:
+    """키와, 그 키가 어느 환경변수에서 왔는지를 돌려준다.
+
+    출처를 함께 돌려주는 것은 로그에 키 대신 이름을 찍기 위해서다.
+    """
+    for name in SUPABASE_KEY_ENV_VARS:
+        value = os.getenv(name)
+        if value:
+            return value, name
+    return None, "(없음)"
+
+
 def initialize_db() -> None:
     global _supabase_client
     if _supabase_client is not None:
@@ -83,11 +98,14 @@ def initialize_db() -> None:
             load_dotenv()
 
         supabase_url = os.getenv("SUPABASE_URL") or os.getenv("SUPABASE_KEY_URL")
-        supabase_key = os.getenv("SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+        supabase_key, key_source = _read_supabase_key()
+        # 키 값은 찍지 않는다. 어느 환경변수에서 왔는지만 있어도 "service_role 로 떠야
+        # 하는데 anon 으로 떴다" 같은 판단은 되고, 그 이상은 로그를 볼 수 있는 사람
+        # 모두에게 자격증명을 넘기는 것이다.
         logger.info(
             "[SUPABASE 연결정보]\n  URL: %s\n  KEY: %s\n",
-            supabase_url,
-            supabase_key
+            supabase_url or "(없음)",
+            f"{key_source} (설정됨)" if supabase_key else "(없음)",
         )
         if not supabase_url or not supabase_key:
             raise RuntimeError("SUPABASE_URL 및 SUPABASE_KEY가 필요합니다")
