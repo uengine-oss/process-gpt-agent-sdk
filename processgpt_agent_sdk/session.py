@@ -129,6 +129,9 @@ class ArchivePart:
     `exclude` 는 최상위 이름으로 거른다. 파드가 기동할 때마다 이미지에서 다시
     만들어지는 것(스킬 사본, 생성된 설정 파일)을 같이 보관하면, 되살아난 옛 사본이
     대화를 옛 이미지에 묶는다.
+
+    **올릴 때와 내릴 때 모두 듣는다.** 제외 목록에 이름을 새로 넣어도 그 전에 올라간
+    객체는 스토리지에 남기 때문에, 내릴 때 거르지 않으면 이미 뺀 것이 계속 따라온다.
     """
 
     name: str
@@ -177,7 +180,7 @@ class SessionArchive:
             if _has_files(part.path):
                 continue
             restored += await asyncio.to_thread(
-                self._restore_part, f"{base}/{part.name}", part.path,
+                self._restore_part, f"{base}/{part.name}", part.path, part.exclude,
             )
         if restored:
             logger.info(
@@ -186,18 +189,26 @@ class SessionArchive:
             )
         return restored
 
-    def _restore_part(self, prefix: str, target: Path) -> int:
+    def _restore_part(self, prefix: str, target: Path, exclude: tuple = ()) -> int:
         store = self._store()
         keys = _walk(store, prefix)
         if not keys:
             return 0
         target.mkdir(parents=True, exist_ok=True)
         restored = 0
+        skipped = 0
         for key in keys:
             relative = _safe_relative(key[len(prefix) + 1:])
             if relative is None:
                 # 스토리지 키는 신뢰 대상이 아니다. 대상 디렉터리 밖으로 쓰면 안 된다.
                 logger.warning("세션 복원에서 거부된 키: %s", key)
+                continue
+            if relative.parts and relative.parts[0] in exclude:
+                # `exclude` 는 올릴 때만이 아니라 내릴 때도 듣는다. 제외 목록에 이름을
+                # 새로 넣어도 그 전에 올라간 객체는 스토리지에 남아 있고, 거르지 않으면
+                # 계속 따라 내려온다 — codex 의 플러그인 캐시(대화당 1,319개 파일)를
+                # 뺐는데도 그 전에 보관된 대화는 복원이 끝나지 않던 이유다.
+                skipped += 1
                 continue
             try:
                 body = store.download(key)
@@ -208,6 +219,8 @@ class SessionArchive:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)
             restored += 1
+        if skipped:
+            logger.info("세션 복원에서 제외된 옛 객체 %d개 | prefix=%s", skipped, prefix)
         return restored
 
     # -- 올리기 -----------------------------------------------------------

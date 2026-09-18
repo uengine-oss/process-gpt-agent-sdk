@@ -227,6 +227,35 @@ class SessionArchiveTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((new_pod / "workspace" / "report.txt").read_text(encoding="utf-8"), "문서")
 
+    async def test_나중에_제외한_것은_내려받지도_않는다(self):
+        """회귀: `exclude` 를 올릴 때만 보고 내릴 때는 안 봤다.
+
+        운영에서 codex 의 플러그인 캐시(대화당 1,319개 파일)를 제외 목록에 넣었는데,
+        그 전에 보관된 대화는 복원이 끝나지 않았다. 스토리지에 남은 옛 객체를 계속
+        내려받고 있었기 때문이다. 제외는 양쪽에서 같은 뜻이어야 한다.
+        """
+        # 제외하기 전에 보관된 상태를 흉내 낸다.
+        old = self.root / "old"
+        home = old / "home"
+        (home / "sessions").mkdir(parents=True)
+        (home / "sessions" / "rollout.jsonl").write_text("전사", encoding="utf-8")
+        (home / ".tmp" / "plugins").mkdir(parents=True)
+        (home / ".tmp" / "plugins" / "a.md").write_text("캐시", encoding="utf-8")
+        await SessionArchive("codex").save(
+            "acme", "room-1", [ArchivePart("home", home)],
+        )
+        self.assertTrue(any(".tmp" in k for k in self.h.objects), "옛 객체가 있어야 한다")
+
+        # 이제 제외 목록에 넣고 새 파드로 복원한다.
+        new_pod = self.root / "new"
+        restored = await SessionArchive("codex").restore(
+            "acme", "room-1", [ArchivePart("home", new_pod / "home", exclude=(".tmp",))],
+        )
+
+        self.assertEqual(restored, 1, "rollout 만 내려받아야 한다")
+        self.assertTrue((new_pod / "home" / "sessions" / "rollout.jsonl").is_file())
+        self.assertFalse((new_pod / "home" / ".tmp").exists(), "제외한 것을 내려받았다")
+
     async def test_이미_있으면_다시_받지_않는다(self):
         parts = self._seed(self.root / "a")
         await SessionArchive("codex").save("acme", "room-1", parts)
