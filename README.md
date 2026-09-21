@@ -9,8 +9,16 @@
 - **이벤트(Event) 전송 규격 통일화** → 결과를 DB에 안전하게 저장  
 - **채팅(SSE) 전송 계층** → 하트비트 · 재접속(attach) · 중지(stop) 를 프레임워크가 제공  
 - **테넌트 인증** → 요청이 보낸 `tenant_id` 를 요청자의 JWT 로 검증  
+- **에이전트 산출물** → 만든 파일을 비공개 버킷에 보관하고 만료되는 서명 주소로 내줌  
 
 👉 쉽게 말하면: **여러 종류의 AI 에이전트를 같은 규칙으로 실행/저장/호출할 수 있게 해주는 통합 SDK** 입니다.  
+
+> **0.8.0 에서 달라진 점**  
+> 에이전트가 만든 파일을 사용자에게 내주는 일이 SDK 로 올라왔습니다. 그동안 에이전트마다
+> 따로 만들어 쓰던 수집·보관·본문 링크 치환을 `processgpt_agent_sdk.artifacts` 하나로
+> 대체합니다. 산출물은 비공개 버킷에 들어가고 주소는 한 시간짜리 서명 주소이며, 만료되면
+> `file_id` 로 다시 발급받습니다. 자세한 내용은 7 을 보세요.
+> 0.8.1 부터는 산출물이 SSE `done` 에도 실려 나갑니다(7.5).
 
 > **0.5.0 에서 달라진 점**  
 > 채팅 SSE 전송 계층과 테넌트 인증이 SDK 로 올라왔습니다. 그동안 각 에이전트
@@ -520,7 +528,7 @@ async def my_handler(request):
 
 - 공통 이벤트 흐름: `Task` → `TaskStatusUpdateEvent[..]` → `TaskArtifactUpdateEvent(last_chunk=True)`
 - **프로세스(폴링) 경로**: `ProcessEventQueue`가 status는 events 테이블, artifact는 todolist 테이블에 저장
-- **채팅(SSE) 경로**: `ChatEventQueue`가 status는 SSE message 청크로, 최종 artifact는 SSE done + chats 테이블 저장으로 변환
+- **채팅(SSE) 경로**: `ChatEventQueue`가 status는 SSE message 청크로, 최종 artifact는 SSE done + chats 테이블 저장으로 변환. 최종 이벤트에 `pdfFiles` 를 실으면 산출물도 같이 따라갑니다(7.5)
 - **전송 계층**: 하트비트·재접속·중지·테넌트 검증은 프레임워크가 처리합니다. Executor 는 이들을 알 필요가 없습니다 (4.5 · 4.6)
 
 ### 6.1 프로세스(폴링)만 실행
@@ -670,17 +678,137 @@ class ExecutorDecides(InflightRegistry):
 set_inflight_registry(ExecutorDecides())
 ```
 
-## 7. 버전업
+## 7. 에이전트 산출물 (artifacts) — 0.8.0 추가
+
+에이전트가 만든 파일을 사용자에게 내주는 일을 SDK 가 공용으로 갖습니다. 에이전트마다
+다시 만들 것이 없습니다.
+
+### 7.1 무엇이 문제였나
+
+이 모듈이 생기기 전에는 에이전트마다 자기 방식이 있었습니다. 한쪽은 자체 store 와
+collector 를, 다른 쪽은 한 시간짜리 토큰 주소를 들고 있었고, **둘 다 주소가 죽으면
+파일을 영영 받을 수 없었습니다.** 공개 버킷의 영구 주소를 쓰던 쪽은 반대 문제가
+있었습니다 — 계약서 검토 결과나 사내 보고서가 주소만 알면 누구나, 언제까지나 열리는
+자리에 놓였습니다.
+
+### 7.2 규약은 디렉터리다
+
+**이번 턴의 `outputs/` 에 놓인 것만 산출물입니다.**
+
+답변 본문을 훑어 경로를 찾아내는 방식은 쓰지 않습니다. 그 경로를 적는 주체가
+에이전트라서, 문장이 바뀔 때마다 규칙을 고쳐야 하고 못 잡으면 사용자는 파일을 받지
+못합니다. 디렉터리는 에이전트가 어떻게 말하든 같습니다.
+
+거둘 때는 **이번 턴에 새로 생기거나 바뀐 것만** 봅니다(`snapshot`). 그러지 않으면
+이어지는 턴마다 같은 파일이 다시 올라가 화면에 같은 것이 여러 번 뜹니다.
+
+### 7.3 구성
+
+| 모듈 | 하는 일 |
+|---|---|
+| `ArtifactCollector` | `outputs/` 를 거둬 산출물 레코드로 만든다 |
+| `ArtifactStore` (Protocol) | 보관하고 주소를 발급하는 계약 |
+| `MementoArtifactStore` | 기본 구현 — Memento 를 거쳐 비공개 버킷에 보관 |
+| `build_artifact` · `download_file` | 서버 안의 정본 ↔ 화면이 읽는 모양 |
+| `strip_local_paths` | 본문에 남은 내부 경로를 산출물 주소로 치환 |
+
+모두 `from processgpt_agent_sdk.artifacts import ...` 로 가져옵니다.
+
+### 7.4 주소는 만료된다
+
+산출물은 비공개 버킷에 들어가고, 주소는 **한 시간짜리 서명 주소**입니다. 주소가 죽어도
+파일은 남아 있으므로 레코드에 실린 `file_id` 로 다시 발급받습니다.
+
+```python
+stored = await store.url_for(tenant_id="acme", file_id="artifacts/<uuid>.docx")
+stored.url         # 새 서명 주소
+stored.expires_at  # 새 만료 시각
+```
+
+레코드에는 `file_id` 와 `url_expires_at` 이 함께 실립니다. 이 둘이 없으면 화면은 주소가
+죽은 뒤 할 수 있는 일이 없습니다 — **만료 시각이 비어 있으면 "만료가 없다"는 뜻**입니다
+(옛 공개 버킷의 영구 주소).
+
+### 7.5 붙이는 법
+
+```python
+from processgpt_agent_sdk.artifacts import (
+    ArtifactCollector, MementoArtifactStore, download_file, strip_local_paths,
+)
+
+collector = ArtifactCollector(MementoArtifactStore(MEMENTO_BASE_URL))
+
+# 턴을 시작할 때 찍는다 — 이번 턴이 만든 것만 가려내기 위해.
+before = collector.snapshot(outputs_dir)
+
+# ... 에이전트가 outputs/ 에 최종본을 놓는다 ...
+
+files = await collector.collect(
+    outputs_dir,
+    tenant_id=tenant_id,
+    conversation_id=conversation_id,
+    before=before,
+    turn_id=turn_id,
+)
+
+# 본문에 남은 내부 경로를 받을 수 있는 주소로 바꾼다.
+answer = strip_local_paths(answer, files)
+```
+
+거둔 레코드는 최종 이벤트의 metadata 에 `pdfFiles` 로 싣습니다.
+
+```python
+ParseDict({"role": "assistant", "pdfFiles": [download_file(f) for f in files]},
+          artifact_evt.metadata)
+```
+
+그러면 SDK 가 두 가지를 함께 처리합니다.
+
+- `chats.messages.pdfFiles` 로 저장 — 방을 다시 열어도 파일이 남습니다.
+- SSE `done` 에 `files` 로 실어 보냄 — 화면이 스트리밍 끝에 쓰는 행에도 들어갑니다.
+
+> ⚠️ `done` 에 싣지 않으면 화면이 자기가 본 것으로 쓴 행에는 산출물이 없습니다. 방을
+> 다시 열었을 때 그 행이 이기면 **만든 파일이 사라진 것처럼 보입니다.** 운영에서 실제로
+> 그렇게 나갔습니다.
+
+### 7.6 거두지 않는 것
+
+| 기준 | 값 | 이유 |
+|---|---|---|
+| 형식 | `DEFAULT_EXTENSIONS` | 실행 파일·소스·로그는 결과물이 아니다 |
+| 크기 | 50MB (`DEFAULT_MAX_BYTES`) | 이보다 크면 업로드가 턴을 붙잡고 화면에서도 받다가 끊긴다 |
+| 빈 파일 | 제외 | |
+
+`collect(..., index=False)` 는 색인을 건너뜁니다. 미리보기처럼 사람이 한 번 보고 마는
+부산물에 씁니다 — 운영에서 미리보기 PDF 를 색인하다가 턴이 5분씩 멈춘 적이 있습니다.
+
+`decorate` 로 레코드마다 저장소별 표시(미리보기 렌더·검수 판정)를 덧붙일 수 있습니다.
+
+### 7.7 운영 준비
+
+Memento 쪽에 **공개 정책이 없는** 버킷이 하나 있어야 합니다. 없으면 산출물 업로드가
+전부 실패합니다.
+
+| 환경변수 | 기본값 | 뜻 |
+|---|---|---|
+| `ARTIFACT_BUCKET` | `artifacts` | 산출물 전용 비공개 버킷 |
+| `ARTIFACT_URL_TTL_SECONDS` | `3600` | 서명 주소 수명(초) |
+
+자세한 내용은 Memento 저장소의 `docs/artifact-bucket.md` 에 있습니다.
+
+---
+
+## 8. 버전업
 - ./release.sh 버전
 - 오류 발생시 : python -m ensurepip --upgrade
 
-## 8. integrations 모듈 안내
+## 9. integrations 모듈 안내
 - 스토리지 업로드 유틸은 `processgpt_agent_sdk.integrations.storage` 로 분리되었습니다.
 - 기존 `processgpt_agent_sdk.utils.upload_file_to_bucket`, `upload_files_to_bucket` 는 하위호환용으로 유지되지만 deprecated 입니다.
 - 신규 코드는 아래 경로를 사용하세요:
   - `from processgpt_agent_sdk.integrations.storage import upload_file_to_bucket, upload_files_to_bucket`
 
-### 8.1 채팅 전송 계층 모듈 (0.5.0 추가)
+### 9.1 채팅 전송 계층 모듈 (0.5.0 추가)
 
 | 모듈 | 들어 있는 것 |
 |---|---|
