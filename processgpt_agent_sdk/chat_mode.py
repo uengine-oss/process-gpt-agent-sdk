@@ -248,12 +248,16 @@ class ChatEventQueue(EventQueue):
         # (Executor가 artifact에 누적 텍스트를 실어 보내는 게 표준 패턴)
         if response_text:
             self._response_text = response_text
-        await self._out_queue.put(
-            {
-                "event": "message",
-                "data": {"type": "done", "content": self._response_text},
-            }
-        )
+        done: Dict[str, Any] = {"type": "done", "content": self._response_text}
+        # 산출물은 done 에도 실어 보낸다.
+        #
+        # 화면은 스트리밍이 끝나면 자기가 본 것으로 assistant row 를 한 벌 쓴다. 서버가
+        # 저장하는 row 와 별개다. 그래서 산출물을 done 에 싣지 않으면, 방을 다시 열었을 때
+        # 산출물 없는 쪽이 보이고 **파일이 사라진 것처럼 된다** — 실제로 그랬다.
+        files = _final_files(event)
+        if files:
+            done["files"] = files
+        await self._out_queue.put({"event": "message", "data": done})
         if self._persist is not None:
             await self._persist(self._request, event, self._response_text)
 
@@ -275,6 +279,19 @@ class ChatStreamer:
     async def send_json(self, data: Any) -> None:
         # JSON chunks are also messages
         await self._out_queue.put({"event": "message", "data": data})
+
+
+def _final_files(event: FinalEvent) -> list:
+    """최종 이벤트가 실어 온 산출물 목록(`pdfFiles`). 없으면 빈 목록."""
+    meta: Any = None
+    try:
+        meta = MessageToDict(event, preserving_proto_field_name=True).get("metadata")
+    except Exception:
+        meta = getattr(event, "metadata", None)
+    if not isinstance(meta, dict):
+        return []
+    files = meta.get("pdfFiles")
+    return list(files) if isinstance(files, list) else []
 
 
 def _build_chat_message_payload(req: ChatRequest, event: FinalEvent, response_text: str) -> Dict[str, Any]:

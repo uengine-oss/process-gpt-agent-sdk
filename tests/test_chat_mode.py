@@ -9,6 +9,7 @@ from a2a.helpers import (
     new_text_status_update_event,
 )
 from a2a.types import Role
+from google.protobuf.json_format import ParseDict
 from a2a.types import TaskState
 
 from processgpt_agent_sdk.chat_mode import (
@@ -97,6 +98,45 @@ class TestChatEventQueue(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["data"]["type"], "done")
         self.assertEqual(item["data"]["content"], "안녕하세요")
         self.assertTrue(getattr(q, "_finalized"))
+
+    async def test_done_carries_the_turns_artifacts(self):
+        """산출물은 done 에도 실려야 한다.
+
+        화면은 스트리밍이 끝나면 자기가 본 것으로 assistant row 를 한 벌 쓴다. 서버가
+        저장하는 row 와 별개다. done 에 산출물이 없으면 방을 다시 열었을 때 산출물 없는
+        쪽이 보이고, 만든 파일이 사라진 것처럼 된다 — 실제로 그랬다.
+        """
+        out_q: asyncio.Queue[dict] = asyncio.Queue()
+        q = ChatEventQueue(out_q, request=ChatRequest(message="user"))
+
+        evt = new_text_artifact_update_event(
+            task_id="t1", context_id="c1", name="assistant_response",
+            text="만들었습니다", last_chunk=True,
+        )
+        ParseDict({"role": "assistant", "pdfFiles": [
+            {"name": "a.xlsx", "url": "https://signed.test/a.xlsx",
+             "file_id": "artifacts/a.xlsx", "url_expires_at": "2026-09-21T04:00:00+00:00"},
+        ]}, evt.metadata)
+        await q.enqueue_event(evt)
+
+        done = (await out_q.get())["data"]
+        self.assertEqual(done["type"], "done")
+        self.assertEqual(len(done["files"]), 1)
+        self.assertEqual(done["files"][0]["file_id"], "artifacts/a.xlsx")
+        self.assertEqual(done["files"][0]["url_expires_at"], "2026-09-21T04:00:00+00:00")
+
+    async def test_done_without_artifacts_says_nothing_about_files(self):
+        """산출물이 없는 턴에 빈 목록을 실어 보내지 않는다 — 화면이 빈 첨부 줄을 그린다."""
+        out_q: asyncio.Queue[dict] = asyncio.Queue()
+        q = ChatEventQueue(out_q, request=ChatRequest(message="user"))
+
+        evt = new_text_artifact_update_event(
+            task_id="t1", context_id="c1", name="assistant_response",
+            text="네", last_chunk=True,
+        )
+        await q.enqueue_event(evt)
+
+        self.assertNotIn("files", (await out_q.get())["data"])
 
     async def test_full_streaming_flow(self):
         # 실제 패턴: Task → Messages (토큰들) → 최종 Artifact
