@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "process-gpt-agent-sdk"
-version = "0.7.2"
+version = "0.8.0"
 description = "Supabase 기반 이벤트/작업 폴링으로 A2A AgentExecutor를 실행하는 SDK"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,6 +18,8 @@ classifiers = [
 ]
 dependencies = [
   "supabase>=2.0.0",
+  # 산출물 보관(artifacts) 이 Memento 와 주고받는다.
+  "httpx>=0.27.0",
   "python-dotenv>=1.0.0",
   "a2a-sdk>=1.0.0",
   "typing-extensions>=4.0.0",
