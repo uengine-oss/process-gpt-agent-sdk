@@ -71,6 +71,10 @@ class ActiveRun:
     done: bool = False
     created_at: float = field(default_factory=time.monotonic)
     done_at: Optional[float] = None
+    # 턴의 출력 큐. 턴 밖(다른 HTTP 요청)에서 이 턴의 스트림에 이벤트를 끼워
+    # 넣으려면 이 큐가 필요하다 — 대표적으로 수정 지시 접수(`steering`) 다.
+    # 구독자 큐에만 넣으면 재접속한 클라이언트만 보고 원래 클라이언트는 못 본다.
+    out_queue: Optional[asyncio.Queue] = None
 
 
 class ChatRunRegistry:
@@ -81,15 +85,22 @@ class ChatRunRegistry:
 
     # -- 턴 생산자 쪽 ------------------------------------------------------
 
-    async def start_run(self, conversation_id: str) -> None:
+    async def start_run(
+        self, conversation_id: str, *, out_queue: Optional[asyncio.Queue] = None
+    ) -> None:
         """새 턴 시작. 같은 conversation_id 에 남아 있던 이전 run 은 교체한다.
 
         교체하지 않으면 이전 턴들의 누적 텍스트가 스냅샷에 계속 붙어 남는다.
+
+        `out_queue` 는 이 턴의 출력 큐다. 주면 `inject()` 로 턴 밖에서 이 스트림에
+        이벤트를 끼워 넣을 수 있다.
         """
         if not conversation_id:
             return
         self._sweep()
-        self._runs[conversation_id] = ActiveRun(conversation_id=conversation_id)
+        self._runs[conversation_id] = ActiveRun(
+            conversation_id=conversation_id, out_queue=out_queue
+        )
 
     async def record(self, conversation_id: str, payload: Dict[str, Any]) -> None:
         """턴이 내보낸 이벤트 1건을 기록하고 구독자에게 전달한다."""
@@ -109,6 +120,22 @@ class ChatRunRegistry:
 
         if payload.get("type") in DONE_TYPES:
             await self.mark_done(conversation_id)
+
+    async def inject(self, conversation_id: str, payload: Dict[str, Any]) -> bool:
+        """진행 중인 턴의 스트림에 이벤트 1건을 끼워 넣는다. 넣었으면 True.
+
+        턴을 만든 요청이 아닌 **다른 요청**이 그 턴의 화면에 뭔가를 말해야 할 때
+        쓴다(수정 지시 접수·반영 알림). 턴의 출력 큐로 넣기 때문에 원래
+        클라이언트와 재접속한 클라이언트가 같은 이벤트를 받는다 — 출력 큐는
+        `RunRecordingQueue` 라서 넣는 즉시 `record()` 까지 타기 때문이다.
+        """
+        run = self._runs.get(conversation_id)
+        if run is None or run.done or run.out_queue is None:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        await run.out_queue.put({"event": "message", "data": payload})
+        return True
 
     async def mark_done(self, conversation_id: str) -> None:
         run = self._runs.get(conversation_id)

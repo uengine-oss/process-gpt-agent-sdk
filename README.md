@@ -46,10 +46,12 @@ flowchart TD
         G["테넌트 가드<br/>(JWT 검증)"] --> S["POST /chat/stream"]
         R["런 레지스트리"] --> A["POST /chat/stream/attach"]
         K["POST /chat/stop"]
+        ST["POST /chat/steer"] --> Q["수정 지시 대기열"]
     end
 
     S --> X
     K -->|취소| X
+    Q -->|안전 지점에서 반영| X
     X -->|TaskStatusUpdateEvent| E
     X -->|TaskArtifactUpdateEvent| T
     X -->|토큰·done| R
@@ -196,7 +198,7 @@ await event_queue.enqueue_event(evt_end)
 
 - **프로세스(폴링)**: `await server.run()`로 DB에서 todo를 가져와 처리
 - **채팅(SSE)**: `/chat/stream` 엔드포인트로 요청을 받아 `Message-only`로 응답 + `chats`에 저장
-- **채팅 부가 라우트**: `/chat/stream/attach`(재접속) · `/chat/stop`(중지)
+- **채팅 부가 라우트**: `/chat/stream/attach`(재접속) · `/chat/stop`(중지) · `/chat/steer`(수정 지시)
 
 ### 4.1 서버 구성 예시 (폴링 + SSE 함께)
 
@@ -219,7 +221,7 @@ async def main():
     )
 
     app = Starlette()
-    # /chat/stream · /chat/stream/attach · /chat/stop 을 한 번에 붙이고,
+    # /chat/stream · /chat/stream/attach · /chat/stop · /chat/steer 를 한 번에 붙이고,
     # tenant_auth 가 켜져 있으면 스트림 경로에 검증 미들웨어도 건다.
     server.mount_chat_routes(app)
 
@@ -441,7 +443,97 @@ curl -X POST http://127.0.0.1:8010/chat/stop \
 
 **하트비트 주기**는 `SSE_HEARTBEAT_SECONDS` 환경변수로 바꿉니다(기본 15초).
 
-### 4.6 테넌트 인증
+### 4.6 수정 지시 (진행 중인 턴의 방향 바꾸기)
+
+작업이 끝나기 전에 방향이 어긋난 것을 발견했을 때, **실행을 취소하고 처음부터 다시
+시키는 대신 지금까지의 맥락을 유지한 채 지시만 바꿉니다.** 사용자는 긴 작업을 자율적으로
+돌려 놓고 필요할 때만 개입합니다.
+
+이건 특정 에이전트의 기능이 아니라 **표준 동작**입니다. SDK 가 요청 형태와 이벤트까지를
+소유하고, 실제 실행 전환은 에이전트별 어댑터가 맡습니다 — 지시를 언제 집어넣어야
+안전한지는 런타임마다 다르기 때문입니다.
+
+```bash
+curl -X POST http://127.0.0.1:8010/chat/steer \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer <supabase-jwt>' \
+  -d '{"conversation_id":"conv-1","tenant_id":"t1","message":"표 대신 글로 써 줘"}'
+```
+
+`/chat/stream` 으로 `{"action":"steer", ...}` 를 보내도 같습니다(엔드포인트를 하나만 아는
+클라이언트를 위해). `action` 이 없는 기존 요청은 **종전대로** 새 턴을 돌립니다. 모르는
+`action` 은 400 입니다 — 오타(`steeer`)를 평범한 메시지로 흘리면 방향을 바꾸려던 요청이
+진행 중인 턴을 대체해 작업을 날립니다.
+
+| 응답 | 의미 |
+|---|---|
+| `{"accepted": true, "directive_id": "…"}` | 받았다. **반영은 아니다**(아래 참고) |
+| `{"accepted": true, "duplicate": true, "directive_id": "…"}` | 같은 문장을 연속으로 받았다. 처음 접수의 id 를 그대로 준다 |
+| `409 {"accepted": false, "reason": "no_active_turn"}` | 돌고 있는 턴이 없다(이미 끝났거나 마무리에 들어갔다) |
+| `409 {"accepted": false, "reason": "awaiting_human_input"}` | 사람의 답을 기다리며 멈춰 있다. 그 질문에 답하는 것이 방향 전환이다 |
+| `501 {"accepted": false, "reason": "unsupported"}` | 이 Executor 가 `steer()` 를 구현하지 않았다 |
+| `400 {"accepted": false, "reason": "empty_message"}` | 보낼 지시가 없다 |
+| `403 {"accepted": false, "reason": "forbidden"}` | 요청자의 테넌트와 방 소유 테넌트가 다르다 |
+
+**접수와 반영은 다른 이벤트입니다.** 접수 시점의 에이전트는 아직 원래 지시대로 도구를
+돌리고 있습니다. 둘을 한 이벤트로 합치면 화면은 접수만으로 "반영 완료" 를 표시하고,
+사용자는 반영되지 않은 결과를 반영된 것으로 읽습니다.
+
+```
+event: message
+data: {"type": "steer_accepted", "directive_id": "…", "content": "표 대신 글로 써 줘"}
+
+event: message
+data: {"type": "steer_applied", "directive_id": "…", "content": "표 대신 글로 써 줘"}
+```
+
+두 이벤트는 **턴의 출력 큐로** 나갑니다 — 원래 클라이언트와 재접속한 클라이언트가 같은
+것을 봅니다. 접수만 되고 아직 반영되지 않은 지시는 재접속 스냅샷에 `pending_steers` 로도
+실립니다.
+
+| 상황 | 처리 |
+|---|---|
+| 도구 실행 중 | 접수만 하고 대기열에 넣는다. 도구를 중간에 끊지 않는다 — 쓰다 만 파일이나 결과 없는 도구 호출을 남기는 편이 더 나쁘다. 어댑터가 다음 안전 지점에서 집어 간다 |
+| 완료 직전 | 어댑터가 마무리 전에 대기열을 닫고 남은 지시를 마지막으로 집어 간다. 닫힌 뒤의 지시는 `no_active_turn` 으로 거절한다 — 받아 두고 아무 데도 반영하지 않는 것보다 거절이 정직하다 |
+| 중복 연속 수신 | 두 번째부터는 쌓지 않고 `duplicate: true` 와 처음 접수의 id 를 준다. 접수 이벤트도 다시 내보내지 않는다 |
+| 사람 확인 대기 중 | 돌고 있는 실행이 없어 넣을 곳이 없다. `awaiting_human_input` 으로 거절한다 |
+| 재접속 | 접수·반영이 다른 이벤트와 같은 큐로 나가므로 그대로 받는다 + 스냅샷의 `pending_steers` |
+
+**어댑터 쪽(에이전트 저장소)** 이 구현할 것은 두 가지입니다 — **지금 받을 수 있는지
+판정**하는 것과, **안전 지점에서 실제로 얹는** 것.
+
+```python
+from processgpt_agent_sdk import SteerDirective, SteerResult, get_steering_inbox, mark_applied
+
+class MyExecutor(AgentExecutor):
+    async def steer(self, directive: SteerDirective) -> SteerResult | None:
+        """지금 방향을 바꿀 수 있는가. None 이면 SDK 의 표준 판정을 그대로 쓴다."""
+        if await self._parked_on_question(directive.conversation_id):
+            return SteerResult.reject("awaiting_human_input")
+        return None
+```
+
+그리고 실행 쪽에서는, **다음 판단이 시작되기 직전**(도구가 끝나고 모델을 부르기 전)마다:
+
+```python
+taken = await get_steering_inbox().take(cid)     # 집어 가기 ≠ 반영
+for directive in taken:
+    await mark_applied(directive)                # 실제로 다음 판단에 넣는 순간
+    ...                                          # directive.message 를 입력에 얹는다
+
+# 더 이상 얹을 지점이 없다면(턴이 끝나려 한다면) 대기열을 닫는다.
+# 닫은 뒤에도 실행이 이어지게 됐다면 reopen(cid) 으로 다시 연다.
+await get_steering_inbox().close(cid)
+```
+
+그 "안전 지점" 이 어디인지는 런타임이 정합니다. deepagents 는 LangChain 미들웨어의
+모델 호출 직전 훅(`abefore_model`)에서 집어 가고, 턴을 끝내려는 시점
+(`aafter_model`)에 한 번 더 확인해 남은 지시가 있으면 모델로 되돌립니다.
+
+`steer()` 가 없으면 그 에이전트는 미지원(501)입니다. 표준 동작을 정의하는 것과 모든
+에이전트가 그것을 할 수 있다고 주장하는 것은 다릅니다.
+
+### 4.7 테넌트 인증
 
 채팅 요청의 `tenant_id` 는 Executor 를 지나 스킬 디렉터리 로드·샌드박스 마운트·작업공간
 경로까지 그대로 흘러갑니다. 검증하지 않으면 값만 바꿔 호출해 남의 테넌트 자원에 닿을 수
@@ -556,7 +648,7 @@ from processgpt_agent_sdk import ProcessGPTAgentServer
 server = ProcessGPTAgentServer(agent_executor=MyExecutor(), agent_type="crewai-action")
 app = Starlette()
 server.mount_chat_routes(app)
-# POST /chat/stream · /chat/stream/attach · /chat/stop
+# POST /chat/stream · /chat/stream/attach · /chat/stop · /chat/steer
 ```
 
 경로를 바꾸거나 일부만 붙일 수도 있습니다. 예전 프론트가 쓰던 별칭 경로가 있으면
@@ -568,6 +660,7 @@ server.mount_chat_routes(
     stream_paths=("/chat/stream", "/{agent_id}/chat/stream"),
     attach_path="/chat/stream/attach",   # None 이면 붙이지 않는다
     stop_path="/chat/stop",              # None 이면 붙이지 않는다
+    steer_path="/chat/steer",            # None 이면 붙이지 않는다
 )
 ```
 

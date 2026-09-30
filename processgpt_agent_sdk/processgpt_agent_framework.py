@@ -40,7 +40,20 @@ from .chat_sse import (
     apply_heartbeat,
     make_attach_handler,
     make_health_handler,
+    make_steer_handler,
     make_stop_handler,
+)
+from .steering import (
+    ACTION_STEER,
+    REASON_EMPTY_MESSAGE,
+    REASON_NO_ACTIVE_TURN,
+    REASON_STEER_FAILED,
+    REASON_UNSUPPORTED,
+    SteerDirective,
+    SteerResult,
+    announce_accepted,
+    get_steering_inbox,
+    is_normal_action,
 )
 from .tenant_auth import ChatTenantGuardMiddleware
 
@@ -490,6 +503,100 @@ class ProcessGPTAgentServer:
             )
             return True
 
+    def supports_steering(self) -> bool:
+        """이 서버에 붙은 Executor 가 수정 지시(스티어링)를 구현하는가.
+
+        표준 동작을 정의하는 것과 모든 에이전트가 그것을 할 수 있다고 주장하는 것은
+        다르다. 구현하지 않은 에이전트에 보내면 `unsupported` 로 거절된다.
+        """
+        return callable(getattr(self.agent_executor, "steer", None))
+
+    async def steer(
+        self,
+        *,
+        conversation_id: str,
+        message: str,
+        tenant_id: str = "",
+        user_uid: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SteerResult:
+        """표준 동작: 진행 중인 턴의 방향을 바꾼다.
+
+        실행을 취소하고 처음부터 다시 시키는 대신, 지금까지의 맥락을 유지한 채
+        지시만 바꾼다. 이 메서드는 표준 규칙(빈 지시·미지원·진행 중인 턴 없음·중복
+        연속 수신·접수 이벤트)까지만 소유하고, **실제 실행 전환은 Executor 의
+        `steer()` 어댑터가 맡는다** — 지시를 언제 집어넣어야 안전한지는 런타임마다
+        다르다. 처리 규칙 전체는 `processgpt_agent_sdk.steering` 문서에 있다.
+
+        어댑터(`Executor.steer(directive)`)가 돌려줄 수 있는 것 —
+            `None`  : 의견 없음. SDK 의 표준 판정을 그대로 쓴다(대부분의 경우).
+            `True`  : 지금 받아도 된다.
+            `False` : 지금은 안 된다(사유 없음 → `no_active_turn`).
+            `SteerResult.reject(...)` : 사유를 직접 정한 거절.
+
+        Returns:
+            SteerResult. 접수(`accepted`)는 반영이 아니다 — 반영은 어댑터가 지시를
+            실제로 다음 판단에 넣는 순간 `steer_applied` 이벤트로 알린다.
+        """
+        text = (message or "").strip()
+        if not text:
+            return SteerResult.reject(REASON_EMPTY_MESSAGE, status_code=400)
+        if not self.supports_steering():
+            return SteerResult.reject(
+                REASON_UNSUPPORTED,
+                status_code=501,
+                detail=f"{self.agent_orch} 에이전트는 수정 지시를 지원하지 않습니다.",
+            )
+
+        inbox = get_steering_inbox()
+        # 마무리에 들어간 턴(대기열이 닫힘)은 진행 중이 아닌 것으로 본다 — 반영할 곳이
+        # 없는 지시를 접수해 두고 조용히 버리는 것보다 거절이 정직하다.
+        turn_active = not inbox.is_closed(conversation_id) and await get_run_registry().is_active(
+            conversation_id
+        )
+        directive = SteerDirective(
+            conversation_id=conversation_id,
+            message=text,
+            turn_active=turn_active,
+            tenant_id=tenant_id,
+            user_uid=user_uid,
+            metadata=dict(metadata or {}),
+        )
+
+        try:
+            verdict = self.agent_executor.steer(directive)
+            if inspect.isawaitable(verdict):
+                verdict = await verdict
+        except Exception as ex:
+            logger.warning(
+                "steer(): 어댑터 판정 실패 | conversation_id=%s", conversation_id, exc_info=True
+            )
+            return SteerResult.reject(
+                REASON_STEER_FAILED, status_code=500, detail=f"{type(ex).__name__}: {ex}"
+            )
+
+        # 어댑터가 거절했으면 그 사유를 그대로 쓴다 — 자기 런타임 상태를 아는 쪽이
+        # 사유를 더 정확하게 만든다(대표적으로 사람 확인 대기 중).
+        if isinstance(verdict, SteerResult) and not verdict.accepted:
+            return verdict
+        if verdict is False:
+            return SteerResult.reject(REASON_NO_ACTIVE_TURN)
+        if not turn_active:
+            return SteerResult.reject(REASON_NO_ACTIVE_TURN)
+
+        accepted_new, effective = await inbox.accept(directive)
+        if effective is None:
+            # 판정과 접수 사이에 턴이 마무리에 들어갔다.
+            return SteerResult.reject(REASON_NO_ACTIVE_TURN)
+        if accepted_new:
+            # 접수 이벤트는 턴의 출력 큐로 나간다 — 원래 클라이언트와 재접속한
+            # 클라이언트가 같은 것을 본다. 중복 연속 수신이면 다시 내보내지 않는다.
+            if not await announce_accepted(effective):
+                # 알릴 스트림이 사라졌다 = 그 사이 턴이 끝났다. 받았다고 답해 두고
+                # 아무 일도 일어나지 않는 것이 제일 나쁘다.
+                return SteerResult.reject(REASON_NO_ACTIVE_TURN)
+        return SteerResult.ok(effective, duplicate=not accepted_new)
+
     def mount_chat_sse(self, app: Any, *, path: str = "/chat/stream"):
         """Starlette/FastAPI 앱에 채팅 SSE 엔드포인트를 마운트합니다.
 
@@ -504,6 +611,11 @@ class ProcessGPTAgentServer:
                 "Starlette is required for mount_chat_sse(). Install with `process-gpt-agent-sdk[sse]`."
             ) from e
 
+        # 동작 유형이 `steer` 인 요청은 새 턴을 돌리는 대신 진행 중인 턴의 방향을
+        # 바꾼다. 전용 경로(`/chat/steer`)와 같은 핸들러를 쓴다 — 프론트가 엔드포인트
+        # 하나만 알고 있어도 되게 하려고 스트림 경로에서도 받는다.
+        steer_handler = make_steer_handler(self.steer, require_auth=self.tenant_auth)
+
         async def handler(request):
             # chats 테이블 저장을 위해 DB 연결 필요
             initialize_db()
@@ -511,6 +623,18 @@ class ProcessGPTAgentServer:
                 body = await request.json()
             except Exception:
                 body = {}
+
+            action = str(body.get("action") or "").strip().lower()
+            if action == ACTION_STEER:
+                return await steer_handler(request)
+            if not is_normal_action(action):
+                # 오타(`steeer` 등)를 평범한 메시지로 흘리면 진행 중인 턴을 대체해
+                # 버린다 — 방향을 바꾸려던 요청이 작업을 날리는 최악의 결과다.
+                from starlette.responses import JSONResponse
+
+                return JSONResponse(
+                    {"error": f"unsupported action: {action}"}, status_code=400
+                )
 
             # 본문에 user_jwt가 없을 때 Authorization: Bearer … 를 채팅 extras/도구까지 전달하기 위해 사용
             auth_jwt = ""
@@ -562,7 +686,12 @@ class ProcessGPTAgentServer:
             # 이벤트 전부가 레지스트리에 남는다 — 재접속한 클라이언트가 받는 것과
             # 원래 클라이언트가 받는 것이 정의상 같아진다.
             out_q: asyncio.Queue[Dict[str, Any]] = RunRecordingQueue(conversation_id)
-            await get_run_registry().start_run(conversation_id)
+            await get_run_registry().start_run(conversation_id, out_queue=out_q)
+            # 이 턴 동안 들어올 수정 지시를 받을 대기열을 연다. 이전 턴의 잔여 지시는
+            # 여기서 버려진다 — 그 턴에 하려던 방향 수정이 다음 턴으로 넘어가면,
+            # 사용자가 지시한 맥락과 다른 곳에 적용된다.
+            turn_token = uuid.uuid4().hex
+            await get_steering_inbox().open(conversation_id, token=turn_token)
 
             if req.stream:
                 ctx.set_streamer(ChatStreamer(out_q))
@@ -593,6 +722,17 @@ class ProcessGPTAgentServer:
                             "data": {"type": "error", "error": f"{type(ex).__name__}: {str(ex)}"},
                         }
                     )
+                finally:
+                    # 턴이 끝났으면 대기열을 닫는다. 이후의 접수 요청은
+                    # `no_active_turn` 으로 거절된다. 어댑터는 보통 마무리 전에 직접
+                    # 닫고 남은 지시를 집어 가므로, 여기 남는 것은 그러지 않는
+                    # 에이전트를 위한 안전장치다.
+                    left = await get_steering_inbox().close(conversation_id, token=turn_token)
+                    if left:
+                        logger.warning(
+                            "steering: 반영되지 못한 수정 지시 %d건 | conversation_id=%s",
+                            len(left), conversation_id,
+                        )
 
             task = asyncio.create_task(_run_executor())
             get_inflight_registry().set_inflight(conversation_id, task)
@@ -613,6 +753,7 @@ class ProcessGPTAgentServer:
         stream_paths: tuple = ("/chat/stream",),
         attach_path: Optional[str] = "/chat/stream/attach",
         stop_path: Optional[str] = "/chat/stop",
+        steer_path: Optional[str] = "/chat/steer",
         health_path: Optional[str] = None,
         health_extra: Optional[Any] = None,
     ):
@@ -627,6 +768,9 @@ class ProcessGPTAgentServer:
                 `/{agent_id}/chat/stream` 같은 별칭을 함께 넘길 수 있다.
             attach_path: None 이면 재접속 라우트를 붙이지 않는다.
             stop_path: None 이면 중지 라우트를 붙이지 않는다.
+            steer_path: 진행 중인 턴의 방향을 바꾸는 경로. None 이면 붙이지 않는다.
+                Executor 가 `steer()` 를 구현하지 않아도 라우트는 붙는다 — 그 경우
+                `unsupported`(501) 로 답하는 것이 표준 동작이다(침묵보다 낫다).
             health_path: 경로를 주면 `/health` 를 붙인다. 기본은 None — 이미 자기
                 `/health` 를 가진 서버가 많아서, 그 경우엔 이걸 켜는 대신
                 `get_inflight_registry().busy()` 를 자기 payload 에 넣으면 된다.
@@ -644,6 +788,11 @@ class ProcessGPTAgentServer:
             _add_route(
                 app, stop_path,
                 make_stop_handler(require_auth=self.tenant_auth), methods=["POST"],
+            )
+        if steer_path:
+            _add_route(
+                app, steer_path,
+                make_steer_handler(self.steer, require_auth=self.tenant_auth), methods=["POST"],
             )
         if health_path:
             _add_route(

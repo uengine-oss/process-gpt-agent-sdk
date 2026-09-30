@@ -39,6 +39,7 @@ from .chat_registry import (
     get_run_registry,
 )
 from .database import fetch_chat_room_tenant_id
+from .steering import REASON_FORBIDDEN, SteerResult, pending_steers_payload
 from .tenant_auth import TenantAuthError, authorize_tenant
 
 logger = logging.getLogger(__name__)
@@ -187,9 +188,16 @@ def make_attach_handler(*, require_auth: bool = True, interval: Optional[float] 
             return _inactive()
         queue, snapshot_text = subscription
 
+        # 접수만 되고 아직 반영되지 않은 수정 지시는 스냅샷에 함께 싣는다 — 재접속한
+        # 화면이 "지시를 보냈는데 흔적이 없는" 상태로 보이면 사용자는 다시 보낸다.
+        snapshot_payload: dict = {"type": "snapshot", "content": snapshot_text}
+        pending = pending_steers_payload(conversation_id)
+        if pending:
+            snapshot_payload["pending_steers"] = pending
+
         async def _stream() -> AsyncIterator[bytes]:
             try:
-                yield format_sse_message({"type": "snapshot", "content": snapshot_text})
+                yield format_sse_message(snapshot_payload)
                 while True:
                     item = await queue.get()
                     yield format_sse_message(item)
@@ -207,6 +215,43 @@ def make_attach_handler(*, require_auth: bool = True, interval: Optional[float] 
         )
 
     return attach_handler
+
+
+def make_steer_handler(steer: Any, *, require_auth: bool = True):
+    """진행 중인 턴의 방향을 바꾸는 핸들러를 만든다.
+
+    전송 계층의 일(본문 파싱·인증·방 소유 확인)만 하고, 판정은 넘겨받은 표준
+    동작(`ProcessGPTAgentServer.steer`)에 맡긴다. 처리 규칙은 `steering` 모듈에
+    한 곳으로 모여 있고, 이 핸들러는 그것을 HTTP 로 노출할 뿐이다.
+    """
+    from starlette.responses import JSONResponse
+
+    async def steer_handler(request: Any) -> Any:
+        body = await _body(request)
+        conversation_id = str(body.get("conversation_id") or "").strip()
+        if not conversation_id:
+            return JSONResponse(
+                {"accepted": False, "reason": "conversation_id required"}, status_code=400
+            )
+
+        tenant_id, error = await _resolve_tenant(request, body, require_auth=require_auth)
+        if error is not None:
+            return error
+        if not await _owns_room(tenant_id, conversation_id):
+            return JSONResponse(
+                {"accepted": False, "reason": REASON_FORBIDDEN}, status_code=403
+            )
+
+        result: SteerResult = await steer(
+            conversation_id=conversation_id,
+            message=str(body.get("message") or body.get("text") or ""),
+            tenant_id=tenant_id,
+            user_uid=str(body.get("user_uid") or body.get("user_id") or ""),
+            metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
+        )
+        return JSONResponse(result.payload(), status_code=result.status_code)
+
+    return steer_handler
 
 
 def make_health_handler(*, extra: Optional[Any] = None):
