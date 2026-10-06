@@ -1411,10 +1411,11 @@ wheels = [
 
 [[package]]
 name = "process-gpt-agent-sdk"
-version = "0.7.0"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "a2a-sdk" },
+    { name = "httpx" },
     { name = "litellm" },
     { name = "pydantic" },
     { name = "python-dotenv" },
@@ -1435,6 +1436,7 @@ sse = [
 [package.metadata]
 requires-dist = [
     { name = "a2a-sdk", specifier = ">=1.0.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "litellm" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'auth'", specifier = ">=2.8.0" },
