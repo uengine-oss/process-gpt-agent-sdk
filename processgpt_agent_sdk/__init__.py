@@ -15,12 +15,20 @@ from .database import (
     record_events_bulk,
     save_task_result,
     update_task_error,
+    release_task_lease,
+    renew_task_lease_sync,
     fetch_form_def,
     fetch_users_grouped,
     fetch_email_users_by_proc_inst_id,
     fetch_tenant_mcp,
     fetch_proc_inst_sources,
     fetch_chat_room_tenant_id,
+)
+from .lease import (
+    LeaseKeeper,
+    heartbeat_seconds,
+    lease_seconds,
+    max_claims,
 )
 from .utils import (
     summarize_error_to_user,
@@ -145,6 +153,13 @@ __all__ = [
     "record_events_bulk",
     "save_task_result",
     "update_task_error",
+    # 작업 점유의 만료 시한(lease)
+    "LeaseKeeper",
+    "lease_seconds",
+    "heartbeat_seconds",
+    "max_claims",
+    "release_task_lease",
+    "renew_task_lease_sync",
     "fetch_form_def",
     "fetch_users_grouped",
     "fetch_email_users_by_proc_inst_id",

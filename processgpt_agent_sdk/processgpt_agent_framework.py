@@ -16,6 +16,8 @@ from a2a.server.events import EventQueue
 from .database import (
     initialize_db,
     polling_pending_todos,
+    release_task_lease,
+    renew_task_lease_sync,
     record_event,
     update_task_error,
     get_consumer_id,
@@ -26,6 +28,7 @@ from .database import (
     fetch_proc_inst_sources,
     fetch_todo_draft_status,
 )
+from .lease import LeaseKeeper
 from .utils import summarize_error_to_user, summarize_feedback, set_agent_model
 from .event_queue_process import ProcessEventQueue, ProcessGPTEventQueue
 from .chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext, ChatStreamer, drain_sse_queue, persist_chat_to_db
@@ -378,21 +381,56 @@ class ProcessGPTAgentServer:
           4) 예외 재전달(상위 루프는 죽지 않고 다음 폴링)
         - 단, 취소(draft_status=CANCELLED)로 인한 CancelledError는 실패가 아니므로
           FAILED 마킹 없이 조용히 종료한다.
+        - 점유를 잃은 경우(다른 워커가 lease 만료로 회수)도 실패가 아니다. 지금
+          이 작업은 다른 워커의 것이므로 FAILED 로 덮으면 그쪽이 끝낸 결과를
+          실패로 바꿔 버린다.
         """
         task_id = row.get("id")
         logger.info("\n🎯 [작업 처리 시작] Task ID: %s", task_id)
 
         friendly_text: Optional[str] = None
 
+        # ---- 점유 유지(lease) ----
+        # 집어 온 행의 lease 는 RPC 가 이미 걸어 두었다. 여기서부터 수행이 끝날
+        # 때까지 그것을 연장한다. 연장이 끊기면 다른 워커가 이 작업을 회수한다.
+        #
+        # 연장이 거절되면(다른 워커가 이미 회수) 진행 중인 실행을 취소한다.
+        # 계속 돌게 두면 같은 작업이 두 곳에서 끝까지 수행되고, 뒤에 끝난 쪽이
+        # 앞의 결과를 덮는다.
+        consumer = get_consumer_id()
+        loop = asyncio.get_running_loop()
+        inflight: Dict[str, Any] = {"exec_task": None}
+
+        def _on_lease_lost(_reason: str) -> None:
+            # LeaseKeeper 의 스레드에서 불린다 — 루프에 올려서 취소한다.
+            task = inflight.get("exec_task")
+            if task is not None and not task.done():
+                loop.call_soon_threadsafe(task.cancel)
+
+        keeper = LeaseKeeper(
+            str(task_id), consumer, renew_task_lease_sync, on_lost=_on_lease_lost
+        ).start()
+
         try:
             # 1) 컨텍스트 준비 (실패 시 ContextPreparationError로 올라옴)
             context = ProcessGPTRequestContext(row)
             await context.prepare_context()
 
+            # 컨텍스트 준비도 시간이 걸린다(여섯 테이블 조회 + 외부 호출).
+            # 그 사이에 점유를 잃었으면 실행을 시작하지 않는다 — 아직
+            # exec_task 가 없어서 취소로 막을 수 있는 대상이 없다.
+            if keeper.lost:
+                logger.warning(
+                    "🚫 컨텍스트 준비 중 점유를 잃었다. 실행하지 않는다 "
+                    "| Task ID: %s", task_id,
+                )
+                return
+
             # 2) 실행 (취소 워처와 동시에)
             logger.info("\n\n🤖 [Agent Orchestrator 실행]")
             event_queue = ProcessEventQueue(str(task_id), self.agent_orch, row.get("proc_inst_id"))
             exec_task = asyncio.create_task(self.agent_executor.execute(context, event_queue))
+            inflight["exec_task"] = exec_task
             watch_task = asyncio.create_task(
                 self._watch_todo_cancellation(context, event_queue, str(task_id), exec_task)
             )
@@ -408,10 +446,24 @@ class ProcessGPTAgentServer:
             logger.info("\n\n🎉 [Agent Orchestrator 완료] Task ID: %s", task_id)
 
         except asyncio.CancelledError:
-            logger.info("🛑 작업이 취소되어 종료 | Task ID: %s", task_id)
+            if keeper.lost:
+                logger.warning(
+                    "🚫 점유를 잃어 작업을 중단했다. 이 작업은 다른 워커가 이어받는다 "
+                    "| Task ID: %s", task_id,
+                )
+            else:
+                logger.info("🛑 작업이 취소되어 종료 | Task ID: %s", task_id)
             return
 
         except Exception as e:
+            if keeper.lost:
+                # 이미 다른 워커의 작업이다. FAILED 로 마킹하면 그쪽이 끝낸
+                # 결과를 실패로 덮는다.
+                logger.warning(
+                    "🚫 점유를 잃은 뒤의 오류는 실패로 기록하지 않는다 "
+                    "| Task ID: %s | %s", task_id, str(e),
+                )
+                return
             logger.error("❌ 작업 처리 중 오류 발생: %s", str(e))
             
             # 컨텍스트 실패라면 friendly가 없을 수 있어, 여기서 반드시 생성
@@ -468,6 +520,17 @@ class ProcessGPTAgentServer:
 
             # 상위로 재전달하여 루프는 계속(죽지 않음)
             logger.error("🔄 오류 처리 완료 - 다음 작업으로 계속 진행")
+
+        finally:
+            keeper.stop()
+            if not keeper.lost:
+                # 남은 lease 를 비운다. 해제하지 않아도 만료되면 회수되지만,
+                # 그때까지(기본 2분) 다음 워커가 이 행을 집지 못한다.
+                # 점유를 잃은 경우에는 건드리지 않는다 — 지금 점유자는 남이다.
+                try:
+                    await release_task_lease(str(task_id), consumer)
+                except Exception:
+                    logger.exception("점유 해제 실패 | Task ID: %s", task_id)
 
     def stop(self):
         self.is_running = False

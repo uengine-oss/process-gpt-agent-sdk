@@ -891,11 +891,64 @@ Memento 쪽에 **공개 정책이 없는** 버킷이 하나 있어야 합니다.
 
 ---
 
-## 8. 버전업
+## 8. 작업 점유의 만료 시한 (lease)
+
+### 8.1 무엇이 문제였나
+
+워커가 todolist 한 건을 집으면 그 행은 `draft_status='STARTED'` 가 됩니다. 예전에는
+거기서 끝이었습니다 — 만료가 없었습니다. 워커가 `kill -9` 로 죽으면(OOM, 노드 축출,
+KEDA 축소) 그 행은 STARTED 로 영구히 남고, 집는 조건(`draft_status IS NULL` 또는
+`FB_REQUESTED`)에 다시 걸리지 않아 **아무도 집지 않습니다.** 사용자에게는 영원히
+끝나지 않는 작업으로 보입니다.
+
+### 8.2 SDK 가 하는 일
+
+에이전트 코드가 따로 할 일은 없습니다. `ProcessGPTAgentServer` 가 알아서 합니다.
+
+1. **집을 때 lease 를 건다** — `fetch_pending_task` 에 `p_lease_seconds` 를 넘깁니다.
+2. **수행 중 연장한다** — `LeaseKeeper` 가 **별도 OS 스레드**에서 `renew_task_lease`
+   를 주기적으로 부릅니다. 익스큐터가 동기 호출로 이벤트 루프를 붙잡고 있어도
+   연장이 멈추지 않아야 하기 때문입니다(멈추면 살아서 일하는 중인 작업이 회수되어
+   두 번 수행됩니다).
+3. **회수당하면 버린다** — 연장이 `not_owner` 로 거절되면(다른 워커가 이미 가져갔다)
+   진행 중인 `execute()` 를 취소하고, FAILED 로 마킹하지 않습니다. 그 작업은 이제
+   남의 것이고, FAILED 로 덮으면 그쪽이 끝낸 결과를 실패로 바꿉니다.
+4. **떠날 때 해제한다** — 정상 종료 시 `release_task_lease` 로 점유를 즉시 비웁니다.
+
+`COMPLETED`·`HUMAN_ASKED`·`CANCELLED` 로 넘어간 작업의 연장 실패는 "버려라" 가
+아닙니다(`not_started`). heartbeat 만 멈추고 작업은 그대로 둡니다 — 사람 답변을
+기다리는 작업이 lease 만료로 회수되지 않는 것도 같은 이유입니다(RPC 가 `STARTED`
+만 회수합니다).
+
+### 8.3 설정
+
+| 환경변수 | 기본값 | 뜻 |
+|---|---|---|
+| `TASK_LEASE_SECONDS` | 120 | 점유가 유지되는 시간 |
+| `TASK_LEASE_HEARTBEAT_SECONDS` | lease/4 (=30) | 연장 주기 |
+| `TASK_MAX_CLAIMS` | 3 | 한 작업이 점유될 수 있는 횟수(최초 + 회수 2회). 넘으면 RPC 가 FAILED 로 종결 |
+
+주기를 lease 의 1/4 로 둔 것은, 일시적 DB 오류로 연속 세 번 놓쳐도 lease 가 남아
+있게 하기 위해서입니다. 1/2 로 두면 한 번 놓치는 것만으로 만료에 닿아 멀쩡한 작업이
+회수됩니다.
+
+### 8.4 DB 쪽 요구사항
+
+`todolist` 에 `lease_until timestamptz` 와 `claim_count integer` 가 있어야 하고,
+`fetch_pending_task` 가 `p_lease_seconds`/`p_max_claims` 를 받아야 합니다. 스키마와
+RPC, 그리고 kind 클러스터 실측 결과는 `process-gpt-infra-docker` 저장소에 있습니다
+(`volumes/db/{init.sql,migration.sql}`, `tests/lease/README.md`).
+
+구버전 SDK 와 섞여 돌아도 됩니다. `p_lease_seconds` 를 넘기지 않는 호출은 lease 없이
+집고(= 예전 동작), lease 가 비어 있는 점유는 회수 대상이 아닙니다.
+
+---
+
+## 9. 버전업
 - ./release.sh 버전
 - 오류 발생시 : python -m ensurepip --upgrade
 
-## 9. integrations 모듈 안내
+## 10. integrations 모듈 안내
 - 스토리지 업로드 유틸은 `processgpt_agent_sdk.integrations.storage` 로 분리되었습니다.
 - 기존 `processgpt_agent_sdk.utils.upload_file_to_bucket`, `upload_files_to_bucket` 는 하위호환용으로 유지되지만 deprecated 입니다.
 - 신규 코드는 아래 경로를 사용하세요:

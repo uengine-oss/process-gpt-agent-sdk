@@ -7,6 +7,8 @@ from importlib import resources
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
+
+from .lease import lease_seconds, max_claims
 import logging
 import random
 
@@ -137,15 +139,28 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
 
     def _call():
         client = get_db_client()
-        consumer_id = consumer or socket.gethostname()
+        # 점유자 이름은 lease 연장의 열쇠다. 연장은 consumer 가 정확히 같을
+        # 때만 통과하므로, 여기서 쓰는 이름과 LeaseKeeper 가 쓰는 이름
+        # (get_consumer_id())이 어긋나면 집은 워커가 자기 점유를 연장하지 못하고
+        # 매번 "남의 작업" 으로 판정돼 하던 일을 버린다. 그래서 같은 함수를 쓴다
+        # (hostname 만으로는 같은 노드의 두 워커가 구분되지 않기도 한다).
+        consumer_id = consumer or get_consumer_id()
 
         # ENV 값을 dev / (그외=prod) 로만 정규화
         p_env = (os.getenv("ENV") or "").lower()
         if p_env != "dev":
             p_env = "prod"
 
+        # 점유에 시한을 걸고 집는다. 이 값을 넘기지 않으면 RPC 는 만료 없는
+        # 점유로 집어, 이 워커가 죽었을 때 아무도 그 작업을 회수하지 못한다.
+        p_lease = lease_seconds()
+        p_max_claims = max_claims()
+
         logger.info("\n🔍 [폴링 시작] 작업 대기 중...")
-        logger.info("agent_orch=%s, consumer_id=%s, p_env=%s, p_limit=%d", agent_orch, get_consumer_id(), p_env, 1)
+        logger.info(
+            "agent_orch=%s, consumer_id=%s, p_env=%s, p_limit=%d, lease=%ds, max_claims=%d",
+            agent_orch, get_consumer_id(), p_env, 1, p_lease, p_max_claims,
+        )
         resp = client.rpc(
             "fetch_pending_task",
             {
@@ -153,6 +168,8 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
                 "p_consumer": consumer_id,
                 "p_limit": 1,
                 "p_env": p_env,
+                "p_lease_seconds": p_lease,
+                "p_max_claims": p_max_claims,
             },
         ).execute()
 
@@ -187,6 +204,54 @@ async def polling_pending_todos(agent_orch: str, consumer: str) -> Optional[Dict
 
     return await _async_retry(_call, name="polling_pending_todos", fallback=lambda: None)
 
+
+
+# ------------------------------ Lease (점유 유지) ------------------------------
+def renew_task_lease_sync(todo_id: str, consumer: str, lease_sec: int) -> Dict[str, Any]:
+    """점유를 연장한다. **동기 함수다** — LeaseKeeper 가 자기 스레드에서 부른다.
+
+    이벤트 루프에 올리지 않는 이유는 lease.py 에 적어 두었다: 익스큐터가 루프를
+    붙잡고 있는 동안 연장이 멈추면, 살아서 일하는 중인 작업이 회수된다.
+
+    돌려주는 값은 RPC 가 준 판정 그대로다({"renewed": bool, "reason": ...}).
+    재시도하지 않는다 — 실패는 호출자가 다음 주기에 다시 시도하는 것이 맞고,
+    여기서 몇 초를 더 기다리면 그만큼 연장이 늦어진다.
+    """
+    if not todo_id or not consumer:
+        return {"renewed": False, "reason": "bad_request"}
+
+    client = get_db_client()
+    resp = client.rpc(
+        "renew_task_lease",
+        {"p_todo_id": str(todo_id), "p_consumer": str(consumer), "p_lease_seconds": int(lease_sec)},
+    ).execute()
+    data = resp.data
+    if isinstance(data, dict):
+        return data
+    # PostgREST 가 스칼라를 리스트로 싸서 줄 수 있다.
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    return {"renewed": False, "reason": "unknown", "raw": data}
+
+
+async def release_task_lease(todo_id: str, consumer: str) -> bool:
+    """점유를 즉시 해제한다. 워커가 작업을 정상적으로 떠날 때 쓴다.
+
+    남은 lease 를 기다리지 않게 해 준다 — 해제하지 않아도 만료되면 회수되지만,
+    그만큼(기본 2분) 다음 워커가 늦게 집는다.
+    """
+    if not todo_id or not consumer:
+        return False
+
+    def _call():
+        client = get_db_client()
+        return client.rpc(
+            "release_task_lease",
+            {"p_todo_id": str(todo_id), "p_consumer": str(consumer)},
+        ).execute()
+
+    res = await _async_retry(_call, name="release_task_lease", retries=1, fallback=lambda: None)
+    return bool(res is not None and getattr(res, "data", None))
 
 # ------------------------------ Fetch Single Todo ------------------------------
 async def fetch_todo_by_id(todo_id: str) -> Optional[Dict[str, Any]]:
@@ -389,7 +454,15 @@ async def update_task_error(todo_id: str) -> None:
 
     def _call():
         client = get_db_client()
-        return client.table("todolist").update({"draft_status": "FAILED", "consumer": None}).eq("id", todo_id).execute()
+        # lease_until 도 비운다. FAILED 는 회수 대상이 아니라 남겨도 집히지는
+        # 않지만, 끝난 작업이 만료를 기다리는 점유를 가리키고 있으면 운영에서
+        # "이 작업은 아직 누가 들고 있다" 로 읽힌다.
+        return (
+            client.table("todolist")
+            .update({"draft_status": "FAILED", "consumer": None, "lease_until": None})
+            .eq("id", todo_id)
+            .execute()
+        )
 
     res = await _async_retry(_call, name="update_task_error", fallback=lambda: None)
     if res is None:
