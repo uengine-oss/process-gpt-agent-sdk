@@ -9,7 +9,7 @@ from a2a.types import TaskArtifactUpdateEvent, TaskState, TaskStatusUpdateEvent
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtobufMessage
 
-from .database import save_task_result
+from .database import mark_task_human_asked, save_task_result
 from .event_coalescer import enqueue_ui_event_coalesced
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,10 @@ class ProcessEventQueue(EventQueue):
     - TaskArtifactUpdateEvent: todolist 에 저장 (last_chunk 가 is_final 로 전달)
     - Task / Message: 저장 대상 아님. silently ignore.
 
+    사람에게 물어 놓고 끝난 실행(INPUT_REQUIRED)은 완료가 아니다. 그 뒤에 오는
+    마지막 아티팩트는 결과가 아니라 질문 본문이므로 todolist 결과로 저장하지 않고
+    작업을 HUMAN_ASKED(사람 답변 대기)로 둔다. crew_completed 도 내지 않는다.
+
     필터링은 Executor 책임이고 SDK 는 받은 대로 라우팅합니다.
     """
 
@@ -46,6 +50,11 @@ class ProcessEventQueue(EventQueue):
         # crew_completed 이벤트 중복 발행 방지 플래그.
         # last_chunk=True artifact 와 task_done() 양쪽에서 트리거 가능하지만 한 번만 기록한다.
         self._completion_emitted = False
+        # 이번 실행이 사람의 답을 기다리며 멈췄는가. INPUT_REQUIRED 로 켜지고,
+        # 그 뒤 실행이 계속되면(WORKING/COMPLETED) 꺼진다 — 같은 실행 안에서
+        # 답을 받아 이어 간 경우의 마지막 아티팩트는 진짜 결과다.
+        self._awaiting_human = False
+        self._human_asked_marked = False
         super().__init__()
 
     async def enqueue_event(self, event: Event):
@@ -76,6 +85,12 @@ class ProcessEventQueue(EventQueue):
                     or getattr(event, "last", None)
                 )
                 artifact_content = self._extract_payload(event)
+                if is_final and self._awaiting_human:
+                    # 질문 본문이다. 결과로 저장하면 COMPLETE 모드에서 SUBMITTED 되어
+                    # 프로세스가 질문을 산출물로 들고 다음 단계로 넘어간다.
+                    logger.info("🙋 사람 답변 대기로 종료 — 결과로 저장하지 않음 (task=%s)", self.todolist_id)
+                    self._mark_human_asked_once()
+                    return
                 logger.info("💾 아티팩트 저장 중... (final=%s)", is_final)
                 asyncio.create_task(save_task_result(self.todolist_id, artifact_content, is_final))
                 logger.info("✅ 아티팩트 저장 완료")
@@ -95,6 +110,10 @@ class ProcessEventQueue(EventQueue):
                 crew_type_val = metadata.get("crew_type")
                 status_obj = getattr(event, "status", None)
                 state_val = getattr(status_obj, "state", None)
+                if state_val == TaskState.TASK_STATE_INPUT_REQUIRED:
+                    self._awaiting_human = True
+                elif state_val in (TaskState.TASK_STATE_WORKING, TaskState.TASK_STATE_COMPLETED):
+                    self._awaiting_human = False
                 # 명시적 metadata 가 자동 매핑보다 우선 (explicit > implicit).
                 # - metadata["event_type"] 가 있으면 그 값을 그대로 사용 (sub-event override 가능)
                 # - 없으면 TaskState 기준 자동 매핑 (_STATE_TO_EVENT_TYPE)
@@ -191,7 +210,18 @@ class ProcessEventQueue(EventQueue):
         # framework 가 Executor.execute() 정상 종료 후 호출하는 안전망.
         # 일반적으로는 last_chunk=True artifact 처리 시 이미 발행되었으므로 noop이다.
         # Executor 가 final artifact 를 emit 하지 않은 케이스를 대비해 명시 호출도 지원.
+        if self._awaiting_human:
+            # 질문만 내고 아티팩트 없이 끝난 실행도 대기로 둔다. 안 그러면 STARTED
+            # 로 남은 채 점유만 풀려 아무도 다시 집지 않는다.
+            self._mark_human_asked_once()
+            return
         self._emit_crew_completed_once()
+
+    def _mark_human_asked_once(self) -> None:
+        if self._human_asked_marked:
+            return
+        self._human_asked_marked = True
+        asyncio.create_task(mark_task_human_asked(self.todolist_id))
 
     def _emit_crew_completed_once(self, proc_inst_id_val: Optional[str] = None) -> None:
         """crew_completed 이벤트를 멱등(idempotent)하게 발행한다.

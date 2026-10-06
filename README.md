@@ -121,6 +121,8 @@ DB 의 `events.event_type` 컬럼은 enum 입니다. Executor 가 emit한 `TaskS
 >
 > **명시 vs 자동 우선순위**: `metadata["event_type"]` 가 있으면 자동 매핑보다 우선합니다 (explicit > implicit). 예: `state=WORKING + metadata["event_type"]="tool_usage_started"` → `tool_usage_started` 로 저장.
 >
+> **사람에게 묻고 끝난 실행 (`INPUT_REQUIRED`)**: 실행 중 `INPUT_REQUIRED` 를 낸 뒤 (`WORKING`/`COMPLETED` 로 이어지지 않고) 끝나면 SDK 는 그 실행을 완료로 보지 않습니다. 뒤따르는 `TaskArtifactUpdateEvent(last_chunk=True)` 는 질문 본문으로 보고 todolist 결과(`output`/`draft`)에 저장하지 않으며, `crew_completed` 도 내지 않습니다. 대신 작업을 `draft_status='HUMAN_ASKED'` 로 두고 점유(consumer, lease)를 풉니다 — `status` 는 `IN_PROGRESS` 그대로입니다. 사용자가 답하면 화면이 `FB_REQUESTED` 로 바꾸고 워커가 다시 집습니다. 아티팩트 없이 상태만 내고 끝나도 같습니다. 이 규칙이 없으면 COMPLETE 모드에서 질문이 산출물로 `SUBMITTED` 되어 프로세스가 다음 단계로 넘어갑니다.
+>
 > **`task_completed` vs `TaskArtifactUpdateEvent`**: 둘은 별개입니다. `task_completed` 는 events 테이블의 lifecycle 표시이고, 실제 결과물 저장은 `TaskArtifactUpdateEvent(last_chunk=True)` 가 todolist 테이블에 수행합니다.
 
 ### A2A 타입 = 라우팅 키 (SDK 는 dumb transport)

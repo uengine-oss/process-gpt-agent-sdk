@@ -370,3 +370,92 @@ class TestProcessEventQueueRouting(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProcessEventQueueHumanAsked(unittest.IsolatedAsyncioTestCase):
+    """사람에게 물어 놓고 끝난 실행은 완료가 아니다.
+
+    deepagents 는 질문할 때 INPUT_REQUIRED 상태 뒤에 질문 본문을 last_chunk
+    아티팩트로 보낸다. 이것을 결과로 저장하면 COMPLETE 모드에서는 질문이
+    산출물로 SUBMITTED 되어 프로세스가 다음 단계로 넘어간다.
+    """
+
+    def setUp(self):
+        self.saves, self.marks, self.events = [], [], []
+
+        async def _save(*args, **kwargs):
+            self.saves.append(args)
+
+        async def _mark(todo_id):
+            self.marks.append(todo_id)
+
+        async def _enqueue(payload):
+            self.events.append(payload)
+
+        for name, fake in (
+            ("save_task_result", _save),
+            ("mark_task_human_asked", _mark),
+            ("enqueue_ui_event_coalesced", _enqueue),
+        ):
+            p = patch(f"processgpt_agent_sdk.event_queue_process.{name}", side_effect=fake)
+            p.start()
+            self.addCleanup(p.stop)
+
+        self.q = ProcessEventQueue(todolist_id="t1", agent_orch="x", proc_inst_id="p1")
+
+    async def _status(self, state):
+        await self.q.enqueue_event(
+            new_text_status_update_event(task_id="t1", context_id="p1", state=state, text="{}")
+        )
+
+    async def _final(self, text):
+        await self.q.enqueue_event(
+            new_text_artifact_update_event(
+                task_id="t1", context_id="p1", name="assistant_response", text=text, last_chunk=True
+            )
+        )
+
+    def _crew_completed(self):
+        return [e for e in self.events if e.get("event_type") == "crew_completed"]
+
+    async def test_question_artifact_is_not_saved_as_result(self):
+        await self._status(TaskState.TASK_STATE_INPUT_REQUIRED)
+        await self._final("결재 금액 상한이 얼마입니까?")
+        self.q.task_done()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(self.saves, [], "질문은 결과로 저장하지 않는다")
+        self.assertEqual(self.marks, ["t1"], "사람 답변 대기로 1회 표시")
+        self.assertEqual(self._crew_completed(), [], "끝난 게 아니므로 crew_completed 없음")
+        self.assertIn("human_asked", [e.get("event_type") for e in self.events], "질문 이벤트는 남는다")
+
+    async def test_question_without_artifact_still_waits(self):
+        # cli-agent 처럼 상태만 내고 끝나는 실행도 STARTED 로 남지 않아야 한다.
+        await self._status(TaskState.TASK_STATE_INPUT_REQUIRED)
+        self.q.task_done()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(self.marks, ["t1"])
+        self.assertEqual(self._crew_completed(), [])
+
+    async def test_answered_in_same_run_then_final_is_result(self):
+        # 같은 실행 안에서 답을 받아 이어 갔으면 마지막 아티팩트는 진짜 결과다.
+        await self._status(TaskState.TASK_STATE_INPUT_REQUIRED)
+        await self._status(TaskState.TASK_STATE_WORKING)
+        await self._final("최종결과")
+        self.q.task_done()
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(self.marks, [])
+        self.assertEqual([a[1:] for a in self.saves], [("최종결과", True)])
+        self.assertEqual(len(self._crew_completed()), 1)
+
+    async def test_progress_chunk_while_waiting_is_still_saved(self):
+        await self._status(TaskState.TASK_STATE_INPUT_REQUIRED)
+        await self.q.enqueue_event(
+            new_text_artifact_update_event(
+                task_id="t1", context_id="p1", name="assistant_response", text="중간", last_chunk=False
+            )
+        )
+        await asyncio.sleep(0.05)
+        self.assertEqual([a[1:] for a in self.saves], [("중간", False)])

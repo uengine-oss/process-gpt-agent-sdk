@@ -470,6 +470,40 @@ async def update_task_error(todo_id: str) -> None:
     else:
         logger.info("update_task_error ok todo_id=%s", todo_id)
 
+
+async def mark_task_human_asked(todo_id: str) -> None:
+    """사람의 답을 기다리며 멈춘 작업으로 표시한다.
+
+    완료가 아니다. status 는 IN_PROGRESS 그대로 두고 output/draft 도 건드리지
+    않는다 — 질문을 결과로 저장하면 COMPLETE 모드에서는 SUBMITTED 되어
+    프로세스가 질문을 답인 양 들고 다음 단계로 넘어간다(실제로 그랬다).
+    질문 본문은 human_asked 이벤트에 이미 남아 있다.
+
+    점유(consumer, lease_until)는 푼다. 답이 오면 화면이 draft_status 를
+    FB_REQUESTED 로 바꾸고, 그때 아무 워커나 다시 집는다. HUMAN_ASKED 는
+    lease 만료 회수 대상이 아니라서 기다리는 동안 다른 워커가 집지 않는다.
+
+    STARTED 일 때만 바꾼다. 그 사이 사용자가 취소했으면 CANCELLED 를 덮지 않는다.
+    """
+    if not todo_id:
+        return
+
+    def _call():
+        client = get_db_client()
+        return (
+            client.table("todolist")
+            .update({"draft_status": "HUMAN_ASKED", "consumer": None, "lease_until": None})
+            .eq("id", todo_id)
+            .eq("draft_status", "STARTED")
+            .execute()
+        )
+
+    res = await _async_retry(_call, name="mark_task_human_asked", fallback=lambda: None)
+    if res is None:
+        logger.error("❌ mark_task_human_asked failed todo_id=%s", todo_id)
+    else:
+        logger.info("mark_task_human_asked ok todo_id=%s", todo_id)
+
 # ============================== Prepare Context ==============================
 
 from typing import Any, Dict, List, Optional, Tuple

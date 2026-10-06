@@ -15,6 +15,7 @@ from .database import (
     record_events_bulk,
     save_task_result,
     update_task_error,
+    mark_task_human_asked,
     release_task_lease,
     renew_task_lease_sync,
     fetch_form_def,
@@ -153,6 +154,7 @@ __all__ = [
     "record_events_bulk",
     "save_task_result",
     "update_task_error",
+    "mark_task_human_asked",
     # 작업 점유의 만료 시한(lease)
     "LeaseKeeper",
     "lease_seconds",
