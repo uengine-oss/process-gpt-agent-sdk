@@ -117,7 +117,7 @@ DB 의 `events.event_type` 컬럼은 enum 입니다. Executor 가 emit한 `TaskS
 > - `TASK_STATE_FAILED` → `error`
 > - `TASK_STATE_INPUT_REQUIRED` → `human_asked`
 >
-> `TASK_STATE_WORKING` 은 의도적으로 자동 매핑 대상이 아닙니다. WORKING 은 너무 광범위하고 도메인 sub-event(`tool_usage_*` 등) 의 베이스로도 재사용되므로, sub-event 의미와 충돌하지 않도록 NULL 로 두거나 `metadata["event_type"]` 으로 명시하세요. metadata 가 없으면 `event_type` 컬럼은 NULL 로 저장됩니다(허용됨).
+> `TASK_STATE_WORKING` 은 의도적으로 자동 매핑 대상이 아닙니다. WORKING 은 너무 광범위하고 도메인 sub-event(`tool_usage_*` 등) 의 베이스로도 재사용되므로, sub-event 의미와 충돌하지 않도록 `metadata["event_type"]` 으로 명시하세요(진행 상황이면 `task_working`). `events.event_type` 은 NOT NULL 이라, metadata 없이 보낸 WORKING 이벤트는 저장이 거절되고 같은 묶음의 다른 이벤트도 한 건씩 다시 저장될 때까지 늦어집니다.
 >
 > **명시 vs 자동 우선순위**: `metadata["event_type"]` 가 있으면 자동 매핑보다 우선합니다 (explicit > implicit). 예: `state=WORKING + metadata["event_type"]="tool_usage_started"` → `tool_usage_started` 로 저장.
 >
@@ -384,7 +384,7 @@ pip install "process-gpt-agent-sdk[sse,auth]"
 `auth` 는 함수 안에서 import 하므로, 인증을 끈 서버는 설치하지 않아도 기동에 영향이
 없습니다(검증을 실제로 시도하는 순간 설치 안내와 함께 500 이 납니다).
 
-참고로, 레포에는 빠르게 확인할 수 있는 샘플(`sample_server/minimal_server.py`, `sample_server/minimal_executor.py`)도 포함되어 있습니다.
+참고로, 레포에는 빠르게 확인할 수 있는 샘플(`sample_server/minimal_server.py`, `sample_server/minimal_executor.py`)과 재개 샘플(§4.9)도 포함되어 있습니다.
 
 ### 4.5 채팅 전송 계층 (하트비트 · 재접속 · 중지)
 
@@ -628,6 +628,56 @@ resume = context.get_context_data()["extras"]["resume"]
   SDK 와 짝지어 배포돼도 `fresh` 로 보고 이전 동작을 유지합니다.
 - 화면은 feedback 항목을 덧붙일 때 `kind`(`human_answer` / `revision`)를 함께 남겨야 합니다.
 - 스펙: `infra/process-gpt/openspec/changes/workitem-resume-default` (`agent-sdk_workitem-resume-signal` 외 서비스별 3개)
+
+### 4.9 재개 샘플 에이전트 (`sample_server/resume_*.py`)
+
+새 에이전트를 붙일 때 따라 할 최소 구현입니다. 실행기가 `extras["resume"]` 하나로 재개
+방식을 고릅니다 — SDK 만 쓰면 크래시 재점유·사람 답변·반려 재작업을 구분해 받습니다.
+
+| 파일 | 역할 |
+|---|---|
+| `sample_server/resume_executor.py` | `plan_run(resume, journal, task)` 가 시작 단계와 입력을 정하고, `ResumableExecutor` 가 3단계(자료 수집 → 초안 작성 → 검토)를 수행 |
+| `sample_server/resume_server.py` | 워커. `agent_orch = resume-sample` 인 작업을 폴링. 기동 때 SDK 버전·경로를 찍는다 |
+| `tests/test_sample_resume.py` | 네 사유별 동작 단위 테스트. 재개 로직을 되돌리면 실패 |
+| `sample_server/e2e/` | 실제 점유 RPC·프로세스 kill·PyPI 설치본으로 네 사유를 확인 |
+
+사유별 동작 — 작업 공간(`SAMPLE_WORKSPACE/<todo id>/`)의 `journal.json` 이 "중단 지점까지의
+기록" 입니다. 실제 에이전트라면 LangGraph 체크포인트, CLI 세션, Codex thread 가 이 자리에 옵니다.
+
+| `kind` | 시작 단계 | 입력(`RunPlan.prompt`) |
+|---|---|---|
+| `fresh` | 1단계(기록 지움) | 원래 지시 |
+| `reclaim` | 완료되지 않은 단계 | `continuation_prompt(원래 지시)` |
+| `human_answer` | 멈춘 단계 | 원래 지시 + `[사람의 답]` **원문**(`answer_raw`) |
+| `revision` | 1단계(기록 지움) | 원래 지시 + `[반려 사유 — 반영해 다시 작성]` 원문 |
+
+```bash
+pip install "process-gpt-agent-sdk>=0.11.0"
+SUPABASE_URL=... SUPABASE_KEY=... \
+SAMPLE_WORKSPACE=/data/workspace SAMPLE_STEP_SECONDS=1 SAMPLE_ASK_BEFORE_STEP=2 \
+  python sample_server/resume_server.py
+```
+
+- `SAMPLE_WORKSPACE`: 재점유하는 워커와 공유해야 합니다(파드라면 PVC).
+- `SAMPLE_ASK_BEFORE_STEP=2`: 2단계 전에 사람에게 묻고(`INPUT_REQUIRED`) 끝냅니다. SDK 가 작업을
+  `HUMAN_ASKED` 로 두고, 화면에서 답하면 `human_answer` 로 다시 집힙니다. 비우면 묻지 않습니다.
+- 저장소 루트에서 `python -m ...` 으로 띄우면 소스가 설치본을 가립니다. 위처럼 스크립트 경로로 띄웁니다.
+
+e2e — 로컬 Supabase(process-gpt-vue3)가 떠 있고 `SUPABASE_URL`/`SUPABASE_KEY` 가 환경이나 `.env` 에
+있으면:
+
+```bash
+sample_server/e2e/run.sh                 # PyPI 의 0.11.0 을 새 venv 에 깔고 돈다
+SDK_VERSION=0.11.1 sample_server/e2e/run.sh
+```
+
+| 시나리오 | 통과 조건 |
+|---|---|
+| 설치본 | 워커가 찍은 SDK 버전이 기대 버전이고 경로가 `site-packages` |
+| 신규 | `fresh`, 단계마다 1줄 |
+| 크래시 재점유 | 1단계 뒤 2단계 도중 프로세스 그룹 `SIGKILL` → 다른 워커가 `claim_count=2`, `reclaim` 으로 완료. 1단계 1줄(죽기 전 줄 유지) |
+| 사람 답변 | `HUMAN_ASKED` + `human_asked` 이벤트 → 화면과 같은 답(`kind: human_answer`) → 답 원문이 다음 실행 입력에, 1단계 1줄 |
+| 초안 반려 | 완료 뒤 화면과 같은 반려(`kind: revision`) → 반려 원문이 입력에, 처음부터 다시(1단계 2줄) |
 
 ---
 
