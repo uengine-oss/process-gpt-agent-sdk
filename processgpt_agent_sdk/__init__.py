@@ -91,8 +91,31 @@ from .session import (
 )
 from .integrations.storage import upload_file_to_bucket, upload_files_to_bucket
 from .single_run import run_single_todo_readonly
+from .resume import (
+    FEEDBACK_KIND_HUMAN_ANSWER,
+    FEEDBACK_KIND_REVISION,
+    RESUME_FRESH,
+    RESUME_HUMAN_ANSWER,
+    RESUME_RECLAIM,
+    RESUME_REVISION,
+    ResumeInfo,
+    continuation_prompt,
+    resume_info_from_row,
+    resume_info_of,
+)
 
 __all__ = [
+    # 워크아이템 재개 정보
+    "FEEDBACK_KIND_HUMAN_ANSWER",
+    "FEEDBACK_KIND_REVISION",
+    "RESUME_FRESH",
+    "RESUME_HUMAN_ANSWER",
+    "RESUME_RECLAIM",
+    "RESUME_REVISION",
+    "ResumeInfo",
+    "continuation_prompt",
+    "resume_info_from_row",
+    "resume_info_of",
     "ProcessGPTAgentServer",
     "ProcessGPTRequestContext",
     "ProcessGPTEventQueue",

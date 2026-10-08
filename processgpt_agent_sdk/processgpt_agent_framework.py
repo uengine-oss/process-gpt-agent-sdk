@@ -30,6 +30,7 @@ from .database import (
     fetch_todo_draft_status,
 )
 from .lease import LeaseKeeper
+from .resume import ResumeInfo, resume_info_from_row
 from .utils import summarize_error_to_user, summarize_feedback, set_agent_model
 from .event_queue_process import ProcessEventQueue, ProcessGPTEventQueue
 from .chat_mode import ChatEventQueue, ChatRequest, ChatRequestContext, ChatStreamer, drain_sse_queue, persist_chat_to_db
@@ -90,6 +91,9 @@ class ProcessGPTRequestContext(RequestContext):
         self._current_task = None
         self._task_state = row.get("draft_status") or ""
         self._extra_context: Dict[str, Any] = {}
+        # 왜 다시 실행되는가(신규/재점유/사람 답변/반려). 점유 RPC 가 돌려준 행만으로
+        # 정해지므로 컨텍스트 준비 전에도 알 수 있다.
+        self._resume: ResumeInfo = resume_info_from_row(row)
 
     async def prepare_context(self) -> None:
         """익스큐터를 위한 컨텍스트 준비를 합니다."""
@@ -217,7 +221,15 @@ class ProcessGPTRequestContext(RequestContext):
                 "summarized_feedback": summarized_feedback,
                 "sensitive_data": self.row.get("sensitive_data") or "{}",
                 "sources": sources,
+                # 재개 정보. 서비스는 이 딕셔너리만 읽어 프레임워크별 재개 방식을
+                # 고른다(LangGraph 입력 None, CLI --resume, Codex 이어서 지시).
+                # 읽지 않는 실행기는 지금과 같게 동작한다.
+                "resume": self._resume.to_dict(),
             }
+            if self._resume.is_resume:
+                logger.info(
+                    "• 재개 사유: %s (점유 %d회차)", self._resume.kind, self._resume.attempt
+                )
             
             logger.info("\n\n🎉 [컨텍스트 준비 완료] 모든 데이터 준비됨")
             
@@ -243,6 +255,11 @@ class ProcessGPTRequestContext(RequestContext):
     @property
     def task_state(self) -> str:
         return self._task_state
+
+    @property
+    def resume(self) -> ResumeInfo:
+        """이번 실행이 무엇의 재개인가. ``extras["resume"]`` 과 같은 값."""
+        return self._resume
 
     def get_context_data(self) -> Dict[str, Any]:
         extras = dict(self._extra_context or {})

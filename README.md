@@ -594,6 +594,41 @@ async def my_handler(request):
 > `tenant_auth=False` 로 둡니다. 이때는 기동 로그에 경고가 남고, 요청 본문의
 > `tenant_id` 가 그대로 Executor 에 전달됩니다.
 
+### 4.8 워크아이템 재개 (왜 다시 실행되는가)
+
+워크아이템이 다시 집히는 이유는 네 가지입니다. SDK 가 점유한 행으로 이유를 정해
+`extras["resume"]`(그리고 `metadata["resume"]`, `context.resume`)에 실어 줍니다.
+
+| `kind` | 언제 | 판정 근거 |
+|---|---|---|
+| `fresh` | 처음 집힘 | 아래 어느 것도 아님 |
+| `reclaim` | 실행하던 워커가 죽어 lease 가 만료되고 다른 워커가 회수 | 점유 RPC 의 `claim_count > 1` (feedback 보다 우선) |
+| `human_answer` | 사람에게 묻고(`HUMAN_ASKED`) 답을 받아 다시 집힘 | feedback 마지막 항목 `kind == "human_answer"` |
+| `revision` | 결과에 대한 반려·피드백으로 다시 집힘 | 마지막 항목 `kind == "revision"`, 또는 `kind` 없음(구버전 화면) |
+
+```python
+resume = context.get_context_data()["extras"]["resume"]
+# {"kind": "reclaim", "attempt": 2, "key": "<todo id>", "answer_raw": ""}
+```
+
+- `attempt` 는 이번 점유 회차, `key` 는 재개 키(todo id = LangGraph `thread_id`, 세션 저장 키),
+  `answer_raw` 는 사람이 남긴 마지막 입력의 **원문**입니다(`summarized_feedback` 은 요약본).
+- 서비스는 이유에 맞는 프레임워크별 재개 방식 하나만 고르면 됩니다.
+
+| 프레임워크 | `reclaim` | `human_answer` |
+|---|---|---|
+| LangGraph | 그래프 `next` 가 남았으면 입력 `None` 으로 `astream` | interrupt 가 있으면 `Command(resume=answer_raw)` |
+| Claude Code CLI | 실행 첫 이벤트에서 저장한 세션으로 `--resume` + 이어서 지시 | 멈춘 세션으로 `--resume` + 원문 답 |
+| Codex app-server | 같은 지시 대신 `continuation_prompt(원래 지시)` | – |
+
+- 표준 이어서 지시: `continuation_prompt(original_task="")`. 해석 함수:
+  `resume_info_of(context | extras)`, `resume_info_from_row(row)`.
+- **하위 호환**: `resume` 을 읽지 않는 Executor 는 이전과 같게 동작합니다. 서비스는 SDK 심볼을
+  import 하지 않고 `extras["resume"]` 딕셔너리만 읽어도 됩니다 — 그러면 이 필드가 없는 구버전
+  SDK 와 짝지어 배포돼도 `fresh` 로 보고 이전 동작을 유지합니다.
+- 화면은 feedback 항목을 덧붙일 때 `kind`(`human_answer` / `revision`)를 함께 남겨야 합니다.
+- 스펙: `infra/process-gpt/openspec/changes/workitem-resume-default` (`agent-sdk_workitem-resume-signal` 외 서비스별 3개)
+
 ---
 
 ## 5. ⚠️ JSON 직렬화 주의 (str() 절대 금지)
