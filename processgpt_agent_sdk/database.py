@@ -333,10 +333,32 @@ async def record_events_bulk(payloads: List[Dict[str, Any]]) -> None:
         return client.rpc("record_events_bulk", {"p_events": safe_list}).execute()
 
     res = await _async_retry(_call, name="record_events_bulk", fallback=lambda: None)
-    if res is None:
-        logger.error("❌ record_events_bulk failed: events not persisted count=%d", len(safe_list))
-    else:
+    if res is not None:
         logger.info("record_events_bulk ok: count=%d", len(safe_list))
+        return
+    if len(safe_list) == 1:
+        logger.error("❌ record_events_bulk failed: events not persisted count=1")
+        return
+
+    # 묶음 저장은 한 건이라도 거절되면(예: 저장소 enum 에 없는 event_type) 통째로
+    # 실패한다. 그대로 두면 같은 묶음에 든 멀쩡한 이벤트 — 작업 실패를 알리는
+    # error, 완료 표시 crew_completed — 까지 함께 사라진다. 한 건씩 다시 저장해
+    # 거절된 것만 잃는다.
+    lost: List[Any] = []
+    for one in safe_list:
+        def _call_one(one=one):
+            client = get_db_client()
+            return client.rpc("record_events_bulk", {"p_events": [one]}).execute()
+
+        if await _async_retry(_call_one, name="record_events_bulk.one", retries=1, fallback=lambda: None) is None:
+            lost.append(one.get("event_type") if isinstance(one, dict) else None)
+    if lost:
+        logger.error(
+            "❌ record_events_bulk: %d/%d events not persisted event_types=%s",
+            len(lost), len(safe_list), lost,
+        )
+    else:
+        logger.info("record_events_bulk ok after per-event retry: count=%d", len(safe_list))
 
 async def record_event(payload: Dict[str, Any]) -> None:
     """단건 이벤트 저장 함수"""
