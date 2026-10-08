@@ -365,6 +365,7 @@ class ProcessGPTAgentServer:
         task_id: str,
         exec_task: asyncio.Task,
         interval: float = 2.0,
+        on_user_cancel: Optional[Any] = None,
     ) -> None:
         """실행 중인 todo의 draft_status가 CANCELLED로 바뀌는지 폴링한다.
 
@@ -381,6 +382,8 @@ class ProcessGPTAgentServer:
             status = str(await fetch_todo_draft_status(task_id) or "").strip().upper()
             if status == "CANCELLED":
                 logger.info("🛑 [작업 취소 감지] Task ID: %s", task_id)
+                if on_user_cancel is not None:
+                    on_user_cancel()
                 try:
                     await self.agent_executor.cancel(context, event_queue)
                 except Exception:
@@ -417,7 +420,11 @@ class ProcessGPTAgentServer:
         # 앞의 결과를 덮는다.
         consumer = get_consumer_id()
         loop = asyncio.get_running_loop()
-        inflight: Dict[str, Any] = {"exec_task": None}
+        inflight: Dict[str, Any] = {"exec_task": None, "user_cancelled": False}
+        # 종료 신호(파드 종료·롤링 배포)로 실행이 끊기면 점유를 비우지 않고 남긴다.
+        # 비우면 STARTED + lease 없음이 되어 점유 RPC 가 아무도 회수하지 않는다.
+        # 남겨 두면 lease 가 만료된 뒤 다른 워커가 재점유(claim_count+1, reclaim)한다.
+        leave_for_reclaim = False
 
         def _on_lease_lost(_reason: str) -> None:
             # LeaseKeeper 의 스레드에서 불린다 — 루프에 올려서 취소한다.
@@ -450,7 +457,10 @@ class ProcessGPTAgentServer:
             exec_task = asyncio.create_task(self.agent_executor.execute(context, event_queue))
             inflight["exec_task"] = exec_task
             watch_task = asyncio.create_task(
-                self._watch_todo_cancellation(context, event_queue, str(task_id), exec_task)
+                self._watch_todo_cancellation(
+                    context, event_queue, str(task_id), exec_task,
+                    on_user_cancel=lambda: inflight.__setitem__("user_cancelled", True),
+                )
             )
             try:
                 await exec_task
@@ -490,8 +500,17 @@ class ProcessGPTAgentServer:
                     "🚫 점유를 잃어 작업을 중단했다. 이 작업은 다른 워커가 이어받는다 "
                     "| Task ID: %s", task_id,
                 )
-            else:
+            elif inflight["user_cancelled"]:
                 logger.info("🛑 작업이 취소되어 종료 | Task ID: %s", task_id)
+            else:
+                leave_for_reclaim = True
+                logger.warning(
+                    "⏸️ 종료 신호로 실행을 멈췄다. 점유를 남겨 lease 만료 뒤 다른 워커가 "
+                    "이어받게 한다 | Task ID: %s", task_id,
+                )
+                # 취소를 삼키면 폴링 루프가 계속 돌아, 종료 중인 이 워커가 lease 만료 뒤
+                # 자기 작업을 다시 집는다. 끝까지 전달해 루프도 멈춘다.
+                raise
             return
 
         except Exception as e:
@@ -546,7 +565,7 @@ class ProcessGPTAgentServer:
 
         finally:
             keeper.stop()
-            if not keeper.lost:
+            if not keeper.lost and not leave_for_reclaim:
                 # 남은 lease 를 비운다. 해제하지 않아도 만료되면 회수되지만,
                 # 그때까지(기본 2분) 다음 워커가 이 행을 집지 못한다.
                 # 점유를 잃은 경우에는 건드리지 않는다 — 지금 점유자는 남이다.
