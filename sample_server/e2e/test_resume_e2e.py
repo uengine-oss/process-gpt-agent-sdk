@@ -39,6 +39,8 @@ MARKER = "[resume-sample]"
 EXPECTED_SDK = os.getenv("RESUME_SAMPLE_SDK_VERSION", "0.11.0")
 LEASE_SECONDS = 8
 TIMEOUT = 120
+#: 워커들이 공유하는 작업 공간. 실행 결과(재개 사유·입력)는 여기 journal.json 에 남는다.
+WORKSPACE: Path | None = None
 
 
 # ------------------------------------------------------------------ DB
@@ -63,12 +65,25 @@ def row(todo_id: str) -> dict:
         f"coalesce(feedback::text, '') FROM todolist WHERE id = {lit(todo_id)}"
     )
     ds, claims, draft, feedback = rows[0]
+    journal = WORKSPACE / todo_id / "journal.json" if WORKSPACE else None
+    try:
+        result = json.loads(journal.read_text(encoding="utf-8")).get("result") if journal else None
+    except (FileNotFoundError, ValueError):
+        result = None
     return {
         "draft_status": ds,
         "claim_count": int(claims),
         "draft": json.loads(draft) if draft else None,
         "feedback": json.loads(feedback) if feedback else None,
+        # 이번 실행의 재개 사유·입력. 화면에 보이는 draft 는 폼 모양의 보고서다.
+        "result": result,
     }
+
+
+def report(r: dict) -> str:
+    """draft({form_id: {필드: 보고서}})의 보고서 본문."""
+    values = [v for form in (r["draft"] or {}).values() if isinstance(form, dict) for v in form.values()]
+    return "\n".join(str(v) for v in values)
 
 
 def event_count(todo_id: str, event_type: str) -> int:
@@ -129,7 +144,7 @@ def wait(todo_id: str, until, what: str, timeout: float = TIMEOUT) -> dict:
 
 
 def completed_as(kind: str):
-    return lambda r: r["draft_status"] == "COMPLETED" and (r["draft"] or {}).get("resume_kind") == kind
+    return lambda r: r["draft_status"] == "COMPLETED" and (r["result"] or {}).get("resume_kind") == kind
 
 
 # ------------------------------------------------------------------ 워커
@@ -242,13 +257,19 @@ def env():
         pytest.fail("SUPABASE_KEY 가 없다")
     if not sql(f"SELECT 1 FROM todolist WHERE id = {lit(TEMPLATE_TODO)}"):
         pytest.fail(f"템플릿 작업 {TEMPLATE_TODO} 가 없다(RESUME_SAMPLE_TEMPLATE_TODO)")
+    # 테스트 워커가 집을 수 있는 남의 행(점유 RPC 조건과 같다)이 있으면 시작하지 않는다.
     pending = sql(
         f"SELECT count(*) FROM todolist WHERE agent_orch = {lit(AGENT_ORCH)} AND status = 'IN_PROGRESS' "
-        f"AND coalesce(activity_name, '') NOT LIKE {lit(MARKER + '%')}"
+        f"AND coalesce(activity_name, '') NOT LIKE {lit(MARKER + '%')} AND ("
+        "  (agent_mode IN ('DRAFT','COMPLETE') AND draft IS NULL AND draft_status IS NULL)"
+        "  OR draft_status = 'FB_REQUESTED'"
+        "  OR (draft_status = 'STARTED' AND lease_until IS NOT NULL AND lease_until < now()))"
     )[0][0]
     if pending != "0":
         pytest.fail(f"agent_orch={AGENT_ORCH} 로 집힐 개발 데이터가 {pending}건 있다")
     e = Env()
+    global WORKSPACE
+    WORKSPACE = e.workspace
     try:
         yield e
     finally:
@@ -283,8 +304,11 @@ def test_1_신규(env):
     todo = env.task()
     r = wait(todo, completed_as("fresh"), "신규 완료")
     assert r["claim_count"] == 1
-    assert r["draft"]["steps"] == ["자료 수집", "초안 작성", "검토"]
+    assert r["result"]["steps"] == ["자료 수집", "초안 작성", "검토"]
     assert [env.count(todo, n) for n in (1, 2, 3)] == [1, 1, 1]
+    # 화면 폼에 들어가는 모양({form_id: {필드: 보고서}})으로 저장된다.
+    assert "재개 사유: fresh" in report(r), r["draft"]
+    assert event_count(todo, "tool_usage_finished") == 3
 
 
 def test_2_크래시_재점유(env):
@@ -300,11 +324,11 @@ def test_2_크래시_재점유(env):
     b = env.worker("crash-B", SAMPLE_STEP_SECONDS="0.5")
     r = wait(todo, completed_as("reclaim"), "재점유 완료")
     assert r["claim_count"] == 2
-    assert r["draft"]["attempt"] == 2
+    assert r["result"]["attempt"] == 2
     assert env.steps(todo)[: len(kept)] == kept, "죽기 전 기록이 사라졌다(작업 공간이 새로 만들어졌다)"
     assert env.count(todo, 1) == 1, f"끝난 1단계를 다시 했다: {env.steps(todo)}"
     assert [env.count(todo, 2), env.count(todo, 3)] == [1, 1]
-    assert r["draft"]["input"].startswith("직전 실행이 중단되었습니다"), r["draft"]["input"]
+    assert r["result"]["input"].startswith("직전 실행이 중단되었습니다"), r["result"]["input"]
     assert "재개 사유: reclaim (점유 2회차)" in b.log_text()
 
 
@@ -322,10 +346,11 @@ def test_3_사람_답변(env):
     answer = "승인자는 홍길동 팀장입니다.\n단, 출장비 항목은 빼 주세요 (원문 그대로)"
     screen_feedback(todo, answer, "human_answer")
     r = wait(todo, completed_as("human_answer"), "답으로 이어서 완료")
-    assert answer in r["draft"]["input"], f"답 원문이 다음 실행 입력에 없다: {r['draft']['input']!r}"
-    assert r["draft"]["approver"] == answer
+    assert answer in r["result"]["input"], f"답 원문이 다음 실행 입력에 없다: {r['result']['input']!r}"
+    assert answer in report(r), "화면에 보이는 결과에 답 원문이 없다"
+    assert r["result"]["approver"] == answer
     assert env.count(todo, 1) == 1, f"묻기 전에 끝낸 1단계를 다시 했다: {env.steps(todo)}"
-    assert r["draft"]["steps"] == ["자료 수집", "초안 작성", "검토"]
+    assert r["result"]["steps"] == ["자료 수집", "초안 작성", "검토"]
 
 
 def test_4_초안_반려(env):
@@ -336,7 +361,7 @@ def test_4_초안_반려(env):
     note = "표 형식으로 다시 써 주세요"
     screen_feedback(todo, note, "revision")
     r = wait(todo, completed_as("revision"), "반려 반영 완료")
-    assert note in r["draft"]["input"]
+    assert note in r["result"]["input"]
     # 반려는 이어 가기가 아니다 — 처음부터 다시 쓴다.
     assert env.count(todo, 1) == 2
-    assert r["draft"]["steps"] == ["자료 수집", "초안 작성", "검토"]
+    assert r["result"]["steps"] == ["자료 수집", "초안 작성", "검토"]

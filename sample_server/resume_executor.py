@@ -110,6 +110,21 @@ class Workspace:
             f.write(line + "\n")
 
 
+def form_result(context: RequestContext, text: str) -> Dict[str, Any]:
+    """결과를 작업 화면의 폼 모양({form_id: {필드 키: 값}})으로 만든다.
+
+    SDK 가 실행 문맥에 실어 주는 form_id·form_fields 의 첫 필드에 보고서를 넣는다.
+    폼이 없으면 ``{"result": text}``.
+    """
+    getter = getattr(context, "get_context_data", None)
+    extras = ((getter() if callable(getter) else {}) or {}).get("extras") or {}
+    fields = extras.get("form_fields") or []
+    form_id = extras.get("form_id")
+    if form_id and isinstance(fields, list) and fields and isinstance(fields[0], dict) and fields[0].get("key"):
+        return {form_id: {fields[0]["key"]: text}}
+    return {"result": text}
+
+
 class ResumableExecutor(AgentExecutor):
     def __init__(self, workspace_root: str | None = None):
         self.root = Path(workspace_root or os.getenv("SAMPLE_WORKSPACE") or ".sample-workspace")
@@ -136,45 +151,61 @@ class ResumableExecutor(AgentExecutor):
         )
         ws.save(journal)
 
-        async def status(state: TaskState, text: str) -> None:
+        async def status(state: TaskState, text: str, event_type: str = "") -> None:
             event = new_text_status_update_event(task_id=task_id, context_id=context_id, state=state, text=text)
-            if state == TaskState.TASK_STATE_WORKING:
+            if event_type:
                 # WORKING 은 자동 매핑되지 않는다. events.event_type 은 NOT NULL 이라
                 # 비워 두면 같은 묶음의 이벤트(human_asked 등)까지 저장이 늦어진다.
-                event.metadata.update({"event_type": "task_working"})
+                event.metadata.update({"event_type": event_type})
             await event_queue.enqueue_event(event)
+
+        def payload(**data: Any) -> str:
+            return json.dumps(data, ensure_ascii=False)
 
         await status(TaskState.TASK_STATE_SUBMITTED, f"재개 사유: {resume.kind} (점유 {resume.attempt}회차)")
 
         done: List[str] = list(journal.get("done") or [])
         for index in range(plan.start, len(STEPS)):
             number = index + 1
+            step = f"step{number} {STEPS[index]}"
             if self.ask_before == number and not journal.get("answer"):
-                # 묻고 끝낸다. SDK 가 작업을 HUMAN_ASKED 로 두고, 화면에서 답하면
-                # human_answer 로 다시 집힌다.
-                await status(TaskState.TASK_STATE_INPUT_REQUIRED, QUESTION)
+                # 묻고 끝낸다. SDK 가 작업을 HUMAN_ASKED 로 두고, 화면 질문 카드에서
+                # 답하면 human_answer 로 다시 집힌다. 카드는 question·type 을 읽는다.
+                await status(TaskState.TASK_STATE_INPUT_REQUIRED, payload(question=QUESTION, type="text"))
                 return
+            # 화면의 에이전트 탭은 단계를 도구 호출(tool_name)로 그린다.
+            await status(TaskState.TASK_STATE_WORKING, payload(tool_name=step), "tool_usage_started")
             await asyncio.sleep(self.step_seconds)
-            ws.log(f"step{number} {STEPS[index]} kind={resume.kind} attempt={resume.attempt}")
+            ws.log(f"{step} kind={resume.kind} attempt={resume.attempt}")
             done.append(STEPS[index])
             journal["done"] = done
             ws.save(journal)
-            await status(TaskState.TASK_STATE_WORKING, f"step{number} {STEPS[index]} 완료")
+            await status(TaskState.TASK_STATE_WORKING, payload(tool_name=step, info=f"{step} 완료"), "tool_usage_finished")
 
-        result = {
+        journal["result"] = {
             "resume_kind": resume.kind,
             "attempt": resume.attempt,
             "steps": done,
             "input": plan.prompt,
             "approver": journal.get("answer", ""),
         }
-        await status(TaskState.TASK_STATE_COMPLETED, "완료")
+        ws.save(journal)
+        report = "\n".join([
+            f"재개 사유: {resume.kind} (점유 {resume.attempt}회차)",
+            f"수행 단계: {' → '.join(done)}",
+            f"승인자: {journal.get('answer') or '-'}",
+            "",
+            "[이번 실행 입력]",
+            plan.prompt,
+        ])
+        # 에이전트 탭의 "작업 결과" 는 완료 이벤트의 본문을 보여 준다.
+        await status(TaskState.TASK_STATE_COMPLETED, report)
         await event_queue.enqueue_event(
             new_text_artifact_update_event(
                 task_id=task_id,
                 context_id=context_id,
                 name="result",
-                text=json.dumps(result, ensure_ascii=False),
+                text=json.dumps(form_result(context, report), ensure_ascii=False),
                 append=False,
                 last_chunk=True,
                 artifact_id=str(uuid.uuid4()),

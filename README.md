@@ -659,6 +659,12 @@ SAMPLE_WORKSPACE=/data/workspace SAMPLE_STEP_SECONDS=1 SAMPLE_ASK_BEFORE_STEP=2 
 ```
 
 - `SAMPLE_WORKSPACE`: 재점유하는 워커와 공유해야 합니다(파드라면 PVC).
+- 화면과 맞춘 모양 — 새 에이전트도 그대로 따르면 작업 화면에 바로 보입니다.
+  - 단계: `WORKING` + `metadata["event_type"]` = `tool_usage_started` / `tool_usage_finished`, 본문
+    `{"tool_name": ..., "info": ...}` → 에이전트 탭에 "도구 사용 중/완료" 로 그려집니다.
+  - 질문: `INPUT_REQUIRED` 본문 `{"question": ..., "type": "text"}` → 질문 카드.
+  - 결과: 아티팩트 `{form_id: {첫 필드 키: 보고서}}`(`form_result()`), 완료 이벤트 본문은 에이전트 탭의
+    "작업 결과" 에 보입니다. 재개 사유·입력은 작업 공간 `journal.json` 의 `result` 에도 남습니다.
 - `SAMPLE_ASK_BEFORE_STEP=2`: 2단계 전에 사람에게 묻고(`INPUT_REQUIRED`) 끝냅니다. SDK 가 작업을
   `HUMAN_ASKED` 로 두고, 화면에서 답하면 `human_answer` 로 다시 집힙니다. 비우면 묻지 않습니다.
 - 저장소 루트에서 `python -m ...` 으로 띄우면 소스가 설치본을 가립니다. 위처럼 스크립트 경로로 띄웁니다.

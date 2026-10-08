@@ -25,6 +25,7 @@ import resume_executor as rx  # noqa: E402
 
 TODO = "00000000-0000-0000-0000-0000000000s1"
 TASK = "지출결의서를 작성하세요"
+FORM_ID = "expense_form"
 
 
 class _Context:
@@ -33,7 +34,11 @@ class _Context:
     def __init__(self, row):
         self.task_id = row["id"]
         self.context_id = "proc-1"
-        self._data = {"row": row, "extras": {"resume": resume_info_from_row(row).to_dict()}}
+        self._data = {"row": row, "extras": {
+            "resume": resume_info_from_row(row).to_dict(),
+            "form_id": FORM_ID,
+            "form_fields": [{"key": "document_result", "text": "결과", "type": "textarea"}],
+        }}
 
     def get_context_data(self):
         return self._data
@@ -52,11 +57,12 @@ class _Queue:
     def states(self):
         return [e.status.state for e in self.events if isinstance(e, TaskStatusUpdateEvent)]
 
-    def result(self):
+    def artifact(self):
         finals = [e for e in self.events if isinstance(e, TaskArtifactUpdateEvent) and e.last_chunk]
-        if not finals:
-            return None
-        return json.loads(finals[-1].artifact.parts[0].text)
+        return json.loads(finals[-1].artifact.parts[0].text) if finals else None
+
+    def event_types(self):
+        return [dict(e.metadata).get("event_type") for e in self.events if isinstance(e, TaskStatusUpdateEvent)]
 
 
 def _row(claim_count=1, feedback=None):
@@ -78,6 +84,7 @@ class SampleResumeTest(unittest.TestCase):
             executor = rx.ResumableExecutor()
         queue = _Queue()
         asyncio.run(executor.execute(_Context(row), queue))
+        queue.result = lambda: rx.Workspace(Path(self.tmp.name), TODO).load().get("result") if queue.artifact() else None
         return queue
 
     def log_lines(self):
@@ -101,6 +108,15 @@ class SampleResumeTest(unittest.TestCase):
         self.assertEqual(result["input"], TASK)
         self.assertEqual([self.count(n) for n in (1, 2, 3)], [1, 1, 1])
 
+    def test_result_is_shaped_for_the_work_item_form(self):
+        q = self.run_once(_row())
+        report = q.artifact()[FORM_ID]["document_result"]
+        self.assertIn("재개 사유: fresh", report)
+        self.assertIn(TASK, report)
+        # 단계는 화면이 그리는 도구 호출 이벤트로 낸다. event_type 을 비우면 저장이 거절된다.
+        self.assertEqual(q.event_types().count("tool_usage_finished"), len(rx.STEPS))
+        self.assertNotIn(None, [t for t, s in zip(q.event_types(), q.states()) if s == TaskState.TASK_STATE_WORKING])
+
     def test_fresh_clears_a_previous_record(self):
         # 같은 키에 남은 기록이 있어도 신규면 이어 가지 않는다.
         self.crash_after_step1()
@@ -123,7 +139,9 @@ class SampleResumeTest(unittest.TestCase):
         answer = "승인자는 홍길동 팀장입니다. 단, 출장비는 빼 주세요"
         asked = self.run_once(_row(), SAMPLE_ASK_BEFORE_STEP="2")
         self.assertEqual(asked.states()[-1], TaskState.TASK_STATE_INPUT_REQUIRED)
-        self.assertIsNone(asked.result())
+        self.assertIsNone(asked.artifact())
+        question = json.loads(asked.events[-1].status.message.parts[0].text)
+        self.assertEqual(question, {"question": rx.QUESTION, "type": "text"})
         self.assertEqual(self.count(1), 1)
 
         q = self.run_once(_row(feedback=_feedback(answer, "human_answer")), SAMPLE_ASK_BEFORE_STEP="2")
