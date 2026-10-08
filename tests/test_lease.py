@@ -376,6 +376,7 @@ class FrameworkLeaseWiringTest(unittest.TestCase):
              patch.object(fw, "release_task_lease", lambda *a: _await_true(released, a)), \
              patch.object(fw.ProcessGPTRequestContext, "prepare_context", fake_prepare), \
              patch.object(fw, "ProcessEventQueue", _NoopQueue), \
+             patch.object(fw, "fail_task_if_still_started", lambda *a: _await_false()), \
              patch.object(fw, "get_consumer_id", lambda: "w1"), \
              patch.dict(os.environ, {"TASK_LEASE_SECONDS": "20", "TASK_LEASE_HEARTBEAT_SECONDS": "1"}):
             asyncio.run(server.process_todolist_item(row))
@@ -420,6 +421,7 @@ class FrameworkLeaseWiringTest(unittest.TestCase):
              patch.object(fw, "release_task_lease", lambda *a: _await_true(released, a)), \
              patch.object(fw.ProcessGPTRequestContext, "prepare_context", slow_prepare), \
              patch.object(fw, "ProcessEventQueue", _NoopQueue), \
+             patch.object(fw, "fail_task_if_still_started", lambda *a: _await_false()), \
              patch.object(fw, "get_consumer_id", lambda: "w1"), \
              patch.dict(os.environ, {"TASK_LEASE_SECONDS": "20",
                                      "TASK_LEASE_HEARTBEAT_SECONDS": "1"}):
@@ -438,6 +440,10 @@ class FrameworkLeaseWiringTest(unittest.TestCase):
         self.assertEqual(released[0][:2], ("11111111-1111-1111-1111-111111111111", "w1"))
 
 
+async def _await_false():
+    return False
+
+
 def _await_true(sink, args):
     sink.append(args)
 
@@ -451,7 +457,12 @@ class _NoopQueue:
     def __init__(self, *_a, **_k):
         pass
 
+    ended_in_failure = False
+
     def task_done(self):
+        pass
+
+    async def drain(self):
         pass
 
     async def enqueue_event(self, *_a, **_k):

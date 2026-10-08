@@ -526,6 +526,41 @@ async def mark_task_human_asked(todo_id: str) -> None:
     else:
         logger.info("mark_task_human_asked ok todo_id=%s", todo_id)
 
+
+async def fail_task_if_still_started(todo_id: str, consumer: str) -> bool:
+    """실행이 끝났는데 아직 내 점유의 STARTED 로 남은 작업을 FAILED 로 종결한다.
+
+    Executor 가 종결 상태를 남기지 않고 반환하면 — 실패 상태 이벤트만 보내고
+    끝나거나, 결과 아티팩트 없이 끝나면 — 행은 STARTED 로 남는다. 그 뒤
+    점유를 해제하면 아무도 다시 집지 않는 고아가 된다(lease 도 비어 회수 대상이
+    아니다). 그래서 해제 전에 여기서 종결한다.
+
+    조건부로만 바꾼다. 결과가 이미 저장됐거나(COMPLETED), 사람 답변 대기로
+    넘어갔거나(HUMAN_ASKED), 사용자가 취소했거나(CANCELLED), 다른 워커가
+    회수했으면(consumer 가 다르다) 아무것도 하지 않는다.
+
+    돌려주는 값: 이 호출이 실제로 행을 바꿨는가.
+    """
+    if not todo_id or not consumer:
+        return False
+
+    def _call():
+        client = get_db_client()
+        return (
+            client.table("todolist")
+            .update({"draft_status": "FAILED", "consumer": None, "lease_until": None})
+            .eq("id", todo_id)
+            .eq("draft_status", "STARTED")
+            .eq("consumer", consumer)
+            .execute()
+        )
+
+    res = await _async_retry(_call, name="fail_task_if_still_started", fallback=lambda: None)
+    if res is None:
+        logger.error("❌ fail_task_if_still_started failed todo_id=%s", todo_id)
+        return False
+    return bool(getattr(res, "data", None))
+
 # ============================== Prepare Context ==============================
 
 from typing import Any, Dict, List, Optional, Tuple

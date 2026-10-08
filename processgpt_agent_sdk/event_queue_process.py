@@ -55,7 +55,31 @@ class ProcessEventQueue(EventQueue):
         # 답을 받아 이어 간 경우의 마지막 아티팩트는 진짜 결과다.
         self._awaiting_human = False
         self._human_asked_marked = False
+        # 실행이 실패 상태(FAILED)를 보냈는가, 결과(final 아티팩트)를 저장했는가.
+        # 실패만 보내고 결과 없이 끝난 실행은 완료가 아니다 — crew_completed 를
+        # 내지 않고, 행의 종결(FAILED)은 framework 가 맡는다.
+        self._failed = False
+        self._result_saved = False
+        # 이 큐가 띄운 DB 쓰기(결과 저장·대기 표시). framework 가 실행 뒤 행
+        # 상태를 판정하기 전에 drain() 으로 기다린다 — 기다리지 않으면 결과
+        # 저장이 끝나기 전의 STARTED 를 보고 "결과 없이 끝났다" 로 오판한다.
+        self._pending: set = set()
         super().__init__()
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    async def drain(self) -> None:
+        """이 큐가 띄운 DB 쓰기가 모두 끝날 때까지 기다린다."""
+        while self._pending:
+            await asyncio.gather(*list(self._pending), return_exceptions=True)
+
+    @property
+    def ended_in_failure(self) -> bool:
+        """실패 상태를 보냈고 그 뒤 결과를 저장하지 않은 채 끝났다."""
+        return self._failed and not self._result_saved
 
     async def enqueue_event(self, event: Event):
         try:
@@ -92,7 +116,9 @@ class ProcessEventQueue(EventQueue):
                     self._mark_human_asked_once()
                     return
                 logger.info("💾 아티팩트 저장 중... (final=%s)", is_final)
-                asyncio.create_task(save_task_result(self.todolist_id, artifact_content, is_final))
+                self._spawn(save_task_result(self.todolist_id, artifact_content, is_final))
+                if is_final:
+                    self._result_saved = True
                 logger.info("✅ 아티팩트 저장 완료")
                 # last_chunk=True 는 작업 완료 신호. crew_completed 도 함께 자동 발행한다.
                 # framework 의 task_done() 도 동일 헬퍼를 호출하지만, 플래그로 중복 방지됨.
@@ -114,6 +140,8 @@ class ProcessEventQueue(EventQueue):
                     self._awaiting_human = True
                 elif state_val in (TaskState.TASK_STATE_WORKING, TaskState.TASK_STATE_COMPLETED):
                     self._awaiting_human = False
+                if state_val == TaskState.TASK_STATE_FAILED:
+                    self._failed = True
                 # 명시적 metadata 가 자동 매핑보다 우선 (explicit > implicit).
                 # - metadata["event_type"] 가 있으면 그 값을 그대로 사용 (sub-event override 가능)
                 # - 없으면 TaskState 기준 자동 매핑 (_STATE_TO_EVENT_TYPE)
@@ -215,13 +243,17 @@ class ProcessEventQueue(EventQueue):
             # 로 남은 채 점유만 풀려 아무도 다시 집지 않는다.
             self._mark_human_asked_once()
             return
+        if self.ended_in_failure:
+            # 실패한 실행이다. crew_completed 를 내면 화면은 완료로 표시한다.
+            logger.info("❌ 실패 상태로 끝난 실행 — 완료 이벤트를 내지 않음 (task=%s)", self.todolist_id)
+            return
         self._emit_crew_completed_once()
 
     def _mark_human_asked_once(self) -> None:
         if self._human_asked_marked:
             return
         self._human_asked_marked = True
-        asyncio.create_task(mark_task_human_asked(self.todolist_id))
+        self._spawn(mark_task_human_asked(self.todolist_id))
 
     def _emit_crew_completed_once(self, proc_inst_id_val: Optional[str] = None) -> None:
         """crew_completed 이벤트를 멱등(idempotent)하게 발행한다.

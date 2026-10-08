@@ -17,6 +17,7 @@ from .database import (
     initialize_db,
     polling_pending_todos,
     release_task_lease,
+    fail_task_if_still_started,
     renew_task_lease_sync,
     record_event,
     update_task_error,
@@ -445,6 +446,27 @@ class ProcessGPTAgentServer:
             event_queue.task_done()
             logger.info("\n\n🎉 [Agent Orchestrator 완료] Task ID: %s", task_id)
 
+            # 3) 종결 확인
+            # Executor 가 종결 상태를 남기지 않고 반환했으면(실패 상태만 보내고
+            # 끝났거나 결과 없이 끝났다) 행은 아직 STARTED 다. 이대로 점유를
+            # 해제하면 아무도 다시 집지 않는 고아가 된다. 결과 저장이 끝난 뒤에
+            # 판정해야 하므로 큐의 DB 쓰기를 먼저 기다린다.
+            await event_queue.drain()
+            if not keeper.lost and await fail_task_if_still_started(str(task_id), consumer):
+                logger.warning(
+                    "⚠️ 실행이 종결 상태 없이 끝나 FAILED 로 종결했다 "
+                    "(실패 상태 보고=%s) | Task ID: %s",
+                    event_queue.ended_in_failure, task_id,
+                )
+                if not event_queue.ended_in_failure:
+                    # 실패를 보고한 실행은 오류 이벤트를 이미 남겼다. 아무것도
+                    # 보고하지 않은 실행만 왜 실패했는지 여기서 남긴다.
+                    self._record_task_error(
+                        row, task_id,
+                        friendly="에이전트가 결과를 남기지 않고 작업을 마쳤습니다. 다시 실행해 주세요.",
+                        raw_error="ExecutorReturnedWithoutResult: 실행이 결과 아티팩트나 실패 보고 없이 끝났다",
+                    )
+
         except asyncio.CancelledError:
             if keeper.lost:
                 logger.warning(
@@ -488,27 +510,11 @@ class ProcessGPTAgentServer:
                 friendly_text = None
 
             # 에러 이벤트 기록(단건). 실패해도 로그만 남기고 진행.
-            logger.info("📤 오류 이벤트 기록 중...")
-            payload: Dict[str, Any] = {
-                "id": str(uuid.uuid4()),
-                "job_id": "TASK_ERROR",
-                "todo_id": str(task_id),
-                "proc_inst_id": row.get("proc_inst_id"),
-                "crew_type": "agent",
-                "event_type": "error",
-                "data": {
-                    "name": "시스템 오류 알림",
-                    "goal": "오류 원인과 대처 안내를 전달합니다.",
-                    "agent_profile": "/images/chat-icon.png",
-                    "friendly": friendly_text or "처리 중 오류가 발생했습니다. 로그를 확인해 주세요.",
-                    "raw_error": f"{type(e).__name__}: {str(e)}" if not isinstance(e, ContextPreparationError) else f"{type(e.original).__name__}: {str(e.original)}",
-                }
-            }
-            try:
-                asyncio.create_task(record_event(payload))
-                logger.info("✅ 오류 이벤트 기록 완료")
-            except Exception:
-                logger.exception("❌ 오류 이벤트 기록 실패")
+            self._record_task_error(
+                row, task_id,
+                friendly=friendly_text or "처리 중 오류가 발생했습니다. 로그를 확인해 주세요.",
+                raw_error=f"{type(e).__name__}: {str(e)}" if not isinstance(e, ContextPreparationError) else f"{type(e.original).__name__}: {str(e.original)}",
+            )
 
             # 상태 FAILED 마킹
             logger.info("🏷️ 작업 상태 FAILED로 마킹 중...")
@@ -531,6 +537,30 @@ class ProcessGPTAgentServer:
                     await release_task_lease(str(task_id), consumer)
                 except Exception:
                     logger.exception("점유 해제 실패 | Task ID: %s", task_id)
+
+    def _record_task_error(self, row: Dict[str, Any], task_id: Any, *, friendly: str, raw_error: str) -> None:
+        """작업 실패를 화면에 알리는 오류 이벤트를 남긴다. 실패해도 로그만 남긴다."""
+        logger.info("📤 오류 이벤트 기록 중...")
+        payload: Dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "job_id": "TASK_ERROR",
+            "todo_id": str(task_id),
+            "proc_inst_id": row.get("proc_inst_id"),
+            "crew_type": "agent",
+            "event_type": "error",
+            "data": {
+                "name": "시스템 오류 알림",
+                "goal": "오류 원인과 대처 안내를 전달합니다.",
+                "agent_profile": "/images/chat-icon.png",
+                "friendly": friendly,
+                "raw_error": raw_error,
+            },
+        }
+        try:
+            asyncio.create_task(record_event(payload))
+            logger.info("✅ 오류 이벤트 기록 완료")
+        except Exception:
+            logger.exception("❌ 오류 이벤트 기록 실패")
 
     def stop(self):
         self.is_running = False
