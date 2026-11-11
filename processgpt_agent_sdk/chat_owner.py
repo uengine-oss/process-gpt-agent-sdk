@@ -454,6 +454,7 @@ class ChatOwnerForwardMiddleware:
             return
 
         if owner and owner != fw.address:
+            logger.info("chat-owner: 넘김 | path=%s conversation_id=%s owner=%s", path, cid, owner)
             if await _forward(fw, owner, scope, body, receive, send):
                 return
             # 주인에게 닿지 않는다 — 그 값일 때만 지우고 직접 처리한다.
