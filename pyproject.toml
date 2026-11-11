@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "process-gpt-agent-sdk"
-version = "0.11.0"
+version = "0.12.0"
 description = "Supabase 기반 이벤트/작업 폴링으로 A2A AgentExecutor를 실행하는 SDK"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -36,6 +36,10 @@ sse = [
 # 테넌트 인증(JWT 검증). 비대칭 서명(JWKS) 검증에 cryptography 가 필요하다.
 auth = [
   "pyjwt[crypto]>=2.8.0",
+]
+# 여러 파드가 대화를 나눠 받을 때 진행 중인 턴의 주인을 적어 두는 곳(chat_owner).
+redis = [
+  "redis>=5.0.0",
 ]
 
 [project.urls]
