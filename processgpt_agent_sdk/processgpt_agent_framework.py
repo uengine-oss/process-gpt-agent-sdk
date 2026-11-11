@@ -61,6 +61,7 @@ from .steering import (
     is_normal_action,
 )
 from .tenant_auth import ChatTenantGuardMiddleware
+from .chat_owner import ChatOwnerForwardMiddleware, hold_ownership, owner_forwarding_from_env
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -865,6 +866,9 @@ class ProcessGPTAgentServer:
 
             task = asyncio.create_task(_run_executor())
             get_inflight_registry().set_inflight(conversation_id, task)
+            # 여러 파드가 대화를 나눠 받는 배포면, 이 턴이 끝날 때까지 "이 대화는 이 파드가
+            # 돌린다" 를 남겨 다른 파드가 재접속 · 중지 · 방향 바꾸기를 여기로 넘기게 한다.
+            hold_ownership(conversation_id, task)
             return apply_heartbeat(
                 StreamingResponse(drain_sse_queue(out_q), media_type="text/event-stream")
             )
@@ -928,6 +932,20 @@ class ProcessGPTAgentServer:
                 app, health_path,
                 make_health_handler(extra=health_extra), methods=["GET"],
             )
+
+        # 여러 파드가 대화를 나눠 받을 때, 진행 중인 턴이 있는 대화의 요청을 그 턴을 돌리는
+        # 파드로 넘긴다(chat_owner 문서). 테넌트 가드보다 먼저 더한다 — Starlette 는 나중에
+        # 더한 미들웨어가 바깥이라, 인증을 먼저 통과한 요청만 넘기게 된다.
+        if owner_forwarding_from_env() is not None:
+            add_owner_middleware = getattr(app, "add_middleware", None)
+            if add_owner_middleware is None:  # pragma: no cover
+                logger.warning("채팅 넘겨주기: add_middleware 가 없는 앱이라 넘겨주기를 걸지 못했다")
+            else:
+                add_owner_middleware(
+                    ChatOwnerForwardMiddleware,
+                    stream_paths=tuple(stream_paths),
+                    other_paths=tuple(p for p in (attach_path, stop_path, steer_path) if p),
+                )
 
         if self.tenant_auth:
             # 스트림 경로는 프레임워크가 소유해 데코레이터를 달 수 없으므로 미들웨어로
