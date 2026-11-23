@@ -52,6 +52,10 @@ logger = logging.getLogger(__name__)
 _TOKEN_CACHE_TTL = 60.0
 _TENANTS_CACHE_TTL = 60.0
 
+# 토큰 시각(iat · nbf · exp)을 검사할 때 허용하는 시계 차이(초). 토큰을 만든 인증 서버와 이 서버의 시계가
+# 몇 초만 어긋나도, 방금 받은 토큰이 "아직 유효하지 않음(iat)"으로 거부되지 않게 한다.
+_CLOCK_LEEWAY = float(os.environ.get("JWT_CLOCK_LEEWAY_SEC", "60") or 60)
+
 _token_cache: Dict[str, Tuple[float, dict]] = {}
 _tenants_cache: Dict[str, Tuple[float, frozenset]] = {}
 
@@ -179,6 +183,7 @@ def _verify_with_jwks(token: str, alg: str) -> dict:
             signing_key.key,
             algorithms=[alg],
             options={"verify_aud": False},
+            leeway=_CLOCK_LEEWAY,
         )
     except jwt.ExpiredSignatureError as e:
         raise TenantAuthError("토큰이 만료되었습니다") from e
@@ -197,6 +202,7 @@ def _verify_with_secret(token: str, secret: str) -> dict:
             # Supabase 토큰의 aud 는 'authenticated' 이지만 커스텀 SSO 토큰은 다를 수 있어
             # 서명·만료만 강제한다.
             options={"verify_aud": False},
+            leeway=_CLOCK_LEEWAY,
         )
     except jwt.ExpiredSignatureError as e:
         raise TenantAuthError("토큰이 만료되었습니다") from e
