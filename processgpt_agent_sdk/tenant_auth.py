@@ -350,6 +350,16 @@ async def authorize_tenant(request: Any) -> RequestIdentity:
     identity = await resolve_identity(request)
     claimed = await _claimed_tenant_id(request)
 
+    if claimed and claimed not in identity.tenant_ids and identity.tenant_ids:
+        # 토큰의 테넌트(클레임)는 그 계정이 처음 만들어진 회사다. 같은 사람이 다른 회사에도 소속되어 있으면(users 테이블에
+        # 그 회사의 행이 있으면) 그 회사로의 요청도 통과시킨다 — 클레임만 보면 다른 회사로 가입한 계정이 지금 회사의 채팅에서
+        # 「테넌트 '…' 에 대한 접근 권한이 없습니다」로 막힌다(2026-11-25 운영). users 행은 서버가 관리하는 소속 기록이고,
+        # 조회가 실패하면 소속 없음으로 처리한다(fail-closed). 클레임에 이미 있는 테넌트는 DB 를 묻지 않는다.
+        extra = await asyncio.to_thread(_tenants_from_db, identity.user_id)
+        if claimed in extra:
+            identity = RequestIdentity(user_id=identity.user_id, email=identity.email,
+                                       tenant_ids=frozenset(identity.tenant_ids | extra))
+
     if claimed:
         if claimed not in identity.tenant_ids:
             logger.warning(

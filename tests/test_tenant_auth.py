@@ -214,6 +214,36 @@ class TestChatTenantGuardMiddleware(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json(), {"seen_tenant_id": "acme"})
 
+    def test_클레임의_회사가_아니어도_users_에_소속이_있으면_통과(self):
+        # 다른 회사로 먼저 가입한 계정(클레임 acme)이 지금 회사(globex)의 구성원이기도 하다(users 행)
+        tenant_auth._tenants_from_db = lambda user_id: frozenset({"acme", "globex"})
+        r = self.client.post(
+            "/chat/stream",
+            json={"tenant_id": "globex"},
+            headers={"authorization": "Bearer acme-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), {"seen_tenant_id": "globex"})
+
+    def test_users_에도_소속이_없으면_여전히_403(self):
+        tenant_auth._tenants_from_db = lambda user_id: frozenset({"acme"})
+        r = self.client.post(
+            "/chat/stream",
+            json={"tenant_id": "globex"},
+            headers={"authorization": "Bearer acme-token"},
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_users_조회가_실패하면_403(self):
+        # (_tenants_from_db 는 DB 실패를 빈 집합으로 바꾼다 — fail-closed, 그 계약 그대로)
+        tenant_auth._tenants_from_db = lambda user_id: frozenset()
+        r = self.client.post(
+            "/chat/stream",
+            json={"tenant_id": "globex"},
+            headers={"authorization": "Bearer acme-token"},
+        )
+        self.assertEqual(r.status_code, 403)
+
     def test_지정하지_않은_경로는_건드리지_않는다(self):
         r = self.client.post("/open", json={"tenant_id": "globex"})
         self.assertEqual(r.status_code, 200)
